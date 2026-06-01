@@ -21,6 +21,12 @@ jobs:
         working-directory: bindings/rust
         run: cargo test --release
 
+      # `cargo test` only builds the bin's test harness into deps/, not the
+      # standalone target/release/nyxstone-tcd the IPC tests spawn. Build it.
+      - name: Build nyxstone-tcd daemon binary (for IPC tests)
+        working-directory: bindings/rust
+        run: cargo build --release --bin nyxstone-tcd
+
       - name: Rust IPC crate tests (nyxstone-tricore-gcc-ipc, via daemon)
         working-directory: bindings/rust-ipc
         run: |
