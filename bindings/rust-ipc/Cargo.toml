@@ -1,0 +1,34 @@
+[package]
+name          = "nyxstone-tricore-gcc-ipc"
+version       = "0.1.0"
+edition       = "2021"
+rust-version  = "1.70"
+authors       = ["emproof"]
+description   = "TriCore assembler/disassembler, MIT-licensed IPC client.  Public API matches the GPL `nyxstone-tricore-gcc` crate byte-for-byte; switch between modes by changing the dependency name in Cargo.toml.  Requires the `nyxstone-tcd` daemon binary (GPL-3.0+, ships with `cargo install nyxstone-tricore-gcc`)."
+license       = "MIT"
+repository    = "https://github.com/emproof-com/NyxstoneTricoreGCC"
+homepage      = "https://github.com/emproof-com/NyxstoneTricoreGCC"
+documentation = "https://docs.rs/nyxstone-tricore-gcc-ipc"
+readme        = "README.md"
+keywords      = ["tricore", "assembler", "disassembler", "embedded", "infineon"]
+categories    = ["development-tools", "hardware-support", "encoding"]
+
+# No GPL files inside this crate, pure Rust client only.
+include = [
+    "Cargo.toml",
+    "src/**/*.rs",
+    "examples/**/*.rs",
+    "README.md",
+    "../../LICENSE-MIT",
+]
+
+[dependencies]
+libc = "0.2"
+
+[[example]]
+name = "smoke"
+path = "examples/smoke.rs"
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"

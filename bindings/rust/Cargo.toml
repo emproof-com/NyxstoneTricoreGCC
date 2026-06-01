@@ -1,0 +1,59 @@
+[package]
+name          = "nyxstone-tricore-gcc"
+version       = "0.1.0"
+edition       = "2021"
+rust-version  = "1.70"
+authors       = ["emproof"]
+description   = "In-process TriCore assembler/disassembler, Rust bindings around binutils-tricore (gas + libopcodes)."
+license       = "GPL-3.0-or-later"
+repository    = "https://github.com/emproof-com/NyxstoneTricoreGCC"
+homepage      = "https://github.com/emproof-com/NyxstoneTricoreGCC"
+documentation = "https://docs.rs/nyxstone-tricore-gcc"
+readme        = "README.md"
+keywords      = ["tricore", "assembler", "disassembler", "embedded", "infineon"]
+categories    = ["development-tools", "hardware-support", "encoding"]
+
+# Explicit whitelist of what gets uploaded by `cargo publish`.  Symlinks
+# under nyxstone-tricore-gcc/ are followed transparently by cargo so the
+# upload contains real C++ source files and prebuilt tarballs (~3.5 MB).
+include = [
+    "Cargo.toml",
+    "build.rs",
+    "src/**/*.rs",
+    "examples/**/*.rs",
+    "README.md",
+    "../../LICENSE",
+    "nyxstone-tricore-gcc/src/**",
+    "nyxstone-tricore-gcc/include/**",
+    "nyxstone-tricore-gcc/c_api/**",
+    "nyxstone-tricore-gcc/binutils-prebuilt/**",
+]
+
+[lib]
+name = "nyxstone_tricore_gcc"
+path = "src/lib.rs"
+
+[dependencies]
+nyxstone-tricore-gcc-ipc = { version = "0.1.0", path = "../rust-ipc", default-features = false }
+libc = "0.2"
+
+[build-dependencies]
+cc = "1.0"
+
+[[bin]]
+name = "nyxstone-tcd"
+path = "src/bin/nyxstone-tcd.rs"
+
+[[example]]
+name = "smoke"
+path = "examples/smoke.rs"
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
+
+# docs.rs sandbox: pre-extracted prebuilts cover both arches; no network
+# access needed.
+[package.metadata.docs.rs]
+default-target = "x86_64-unknown-linux-gnu"
+targets        = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]

@@ -1,0 +1,42 @@
+[build-system]
+requires      = ["setuptools>=64", "wheel", "cffi>=1.16"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "nyxstone-tricore-gcc"
+version         = "0.1.0"
+description     = "In-process TriCore assembler/disassembler, Python bindings around binutils-tricore (gas + libopcodes)."
+readme          = "README.md"
+license         = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.8"
+dependencies    = ["cffi>=1.16"]
+authors         = [{ name = "emproof" }]
+keywords        = ["tricore", "assembler", "disassembler", "embedded", "infineon", "binutils"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Assemblers",
+    "Topic :: Software Development :: Disassemblers",
+    "Topic :: Software Development :: Embedded Systems",
+]
+
+[project.urls]
+Homepage      = "https://github.com/emproof-com/NyxstoneTricoreGCC"
+Repository    = "https://github.com/emproof-com/NyxstoneTricoreGCC"
+Issues        = "https://github.com/emproof-com/NyxstoneTricoreGCC/issues"
+Documentation = "https://github.com/emproof-com/NyxstoneTricoreGCC#readme"
+
+[tool.setuptools]
+packages = ["nyxstone_tricore_gcc"]
+
+[tool.setuptools.cmdclass]
+# build_ext is configured in setup.py via cffi.

@@ -1,0 +1,34 @@
+# Build outputs.
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.dSYM
+build/
+build-*/
+
+# Extracted/built binutils-tricore tree (committed prebuilts in
+# third_party/binutils-tricore-prebuilt/ are extracted into here on demand).
+third_party/binutils-tricore/
+
+# Top-level binaries from the Makefile target list.
+/smoke
+/bench
+/run_tests
+
+# Rust.
+bindings/rust/target/
+bindings/rust/Cargo.lock
+bindings/rust-ipc/target/
+bindings/rust-ipc/Cargo.lock
+
+# Python.
+bindings/python/build/
+bindings/python/dist/
+bindings/python/*.egg-info/
+bindings/python/nyxstone_tricore/_native.*
+bindings/python/nyxstone_tricore/_native.c
+__pycache__/
+*.pyc

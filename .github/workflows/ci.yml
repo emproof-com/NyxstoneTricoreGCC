@@ -1,0 +1,35 @@
+# Minimal CI: extract prebuilts → build → run all three surfaces' tests.
+# Designed for the free public-repo tier: single ubuntu-latest x86_64 job,
+# ~45-60 seconds wall clock end-to-end.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: C++ build + tests
+        run: make test
+
+      - name: Rust GPL crate tests (nyxstone-tricore-gcc, in-process)
+        working-directory: bindings/rust
+        run: cargo test --release
+
+      - name: Rust IPC crate tests (nyxstone-tricore-gcc-ipc, via daemon)
+        working-directory: bindings/rust-ipc
+        run: |
+          NYXSTONE_TCD_PATH=../rust/target/release/nyxstone-tcd \
+            cargo test --release
+
+      - name: Python smoke
+        working-directory: bindings/python
+        run: |
+          python3 -m pip install --quiet cffi
+          python3 setup.py build_ext --inplace
+          PYTHONPATH=. python3 examples/smoke.py

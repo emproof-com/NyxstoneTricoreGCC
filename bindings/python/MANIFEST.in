@@ -1,0 +1,7 @@
+# Include everything the symlinked nyxstone-tricore-gcc/ tree points at, so
+# the sdist is self-contained for pip install from PyPI.
+recursive-include nyxstone-tricore-gcc *
+# Top-level license + readme.
+include README.md
+include ../../LICENSE
+include ../../LICENSE-MIT

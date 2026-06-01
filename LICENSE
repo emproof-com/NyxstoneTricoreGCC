@@ -1,0 +1,20 @@
+NyxstoneTricoreGCC is licensed under the GNU General Public License version
+3.0 or any later version (GPL-3.0-or-later).
+
+The library statically links GNU assembler (gas) object files from binutils, including `tc-tricore.o`, `read.o`, `write.o`, `cond.o`, and the gas core, together with `libbfd` and `libopcodes`.  gas is GPL-3.0-or-later, which
+propagates to any binary distribution of this library.  libbfd and
+libopcodes are LGPL-3.0-or-later, which is compatible with (and absorbed by)
+the GPL-3.0-or-later term.
+
+Full GPL-3.0 text: https://www.gnu.org/licenses/gpl-3.0.txt
+
+----------------------------------------------------------------------
+
+                    GNU GENERAL PUBLIC LICENSE
+                       Version 3, 29 June 2007
+
+Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+Everyone is permitted to copy and distribute verbatim copies of this
+license document, but changing it is not allowed.
+
+(... see https://www.gnu.org/licenses/gpl-3.0.txt for the full text.)
