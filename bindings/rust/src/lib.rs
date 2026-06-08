@@ -39,7 +39,8 @@
 //!
 //! let nx = NyxstoneTricoreGCC::new()?;
 //! let bytes = nx.assemble("start:\n nop\n j here\nhere:\n ret\n", 0, &[])?;
-//! assert_eq!(bytes, [0x00, 0x00, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x90]);
+//! // `j here` relaxes to its 2-byte short form and targets `here` (disp 0x01).
+//! assert_eq!(bytes, [0x00, 0x00, 0x3c, 0x01, 0x00, 0x90]);
 //!
 //! let insns = nx.disassemble_to_instructions(&bytes, 0x80000000, 0)?;
 //! for ins in &insns {
@@ -450,7 +451,47 @@ mod tests {
     fn assemble_labels() {
         let nx = NyxstoneTricoreGCC::new().unwrap();
         let b = nx.assemble("start:\n nop\n j here\nhere:\n ret\n", 0, &[]).unwrap();
-        assert_eq!(b, vec![0x00, 0x00, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x90]);
+        // `j here` relaxes to its 2-byte short form and targets `here` (disp 0x01).
+        assert_eq!(b, vec![0x00, 0x00, 0x3c, 0x01, 0x00, 0x90]);
+    }
+
+    #[test]
+    fn relax_local_short_external_long() {
+        let nx = NyxstoneTricoreGCC::new().unwrap();
+        // A same-section target relaxes to the 2-byte short `j` (opcode 0x3c),
+        // whether the label sits after the branch (backward)...
+        let back = nx.assemble("a:\n nop\n nop\n j a\n", 0, &[]).unwrap();
+        assert_eq!(back.len(), 6); // nop nop (4) + short j (2)
+        assert_eq!(back[4], 0x3c);
+        // ...or before it (forward).
+        let fwd = nx.assemble("j t\n nop\n nop\nt:\n ret\n", 0, &[]).unwrap();
+        assert_eq!(fwd.len(), 8); // short j (2) + nop nop (4) + ret (2)
+        assert_eq!(fwd[0], 0x3c);
+        // An external target (resolved via LabelDefinition) stays the 4-byte
+        // long `j` (opcode 0x1d) to keep maximum displacement range for the
+        // linker. Undefined targets that emit relocations likewise stay long;
+        // see `assemble_with_relocs_emits_entry`.
+        let labels = [LabelDefinition::new("ext", 0x4000)];
+        let ext = nx.assemble("nop\n nop\n j ext\n", 0, &labels).unwrap();
+        assert_eq!(ext.len(), 8); // nop nop (4) + long j (4)
+        assert_eq!(ext[4], 0x1d);
+    }
+
+    #[test]
+    fn branch_displacements_resolve() {
+        let nx = NyxstoneTricoreGCC::new().unwrap();
+        // Forward branch over several instructions must target the label, not
+        // itself: `l` is the last instruction, at base + len - 2 (ret = 2 B).
+        let b = nx.assemble("j l\n nop\n nop\n nop\nl: ret\n", 0x1000, &[]).unwrap();
+        let want = 0x1000 + b.len() as u64 - 2;
+        let dis = nx.disassemble(&b, 0x1000, 0).unwrap();
+        let first = dis.lines().next().unwrap();
+        assert!(first.contains(&format!("0x{want:x}")), "fwd: {first:?} want 0x{want:x}");
+        // Backward branch must target the first instruction (the base address).
+        let b = nx.assemble("l: nop\n nop\n nop\n j l\n", 0x1000, &[]).unwrap();
+        let dis = nx.disassemble(&b, 0x1000, 0).unwrap();
+        let last = dis.lines().last().unwrap();
+        assert!(last.contains("0x1000"), "back: {last:?} want 0x1000");
     }
 
     #[test]

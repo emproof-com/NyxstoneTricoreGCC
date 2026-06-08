@@ -1,17 +1,26 @@
-//! Lazy daemon spawn: one `nyxstone-tcd` child per parent process, owned by
-//! the parent.  The child receives an inherited socketpair fd (no filesystem
-//! socket) and dies automatically when its parent does, via the kernel's
-//! `PR_SET_PDEATHSIG` mechanism on Linux.
+//! Lazy daemon spawn: one `nyxstone-tcd` child per `NyxstoneTricoreGCC`
+//! instance, owned by that instance.  The child receives an inherited
+//! socketpair fd (no filesystem socket) and its lifetime is tied to that
+//! socket — *not* to the thread that spawned it.
 //!
 //! Lifecycle:
-//!   - Parent calls `Daemon::spawn(...)`.
-//!   - We `socketpair()`, clear `FD_CLOEXEC` on the child end, then fork+exec
-//!     the daemon binary with `NYXSTONE_TCD_FD={child_fd}` in env.
-//!   - The daemon installs `PR_SET_PDEATHSIG(SIGTERM)` so the kernel kills it
-//!     when the parent goes away (crash, kill -9, normal exit, all of them).
-//!   - Parent keeps the other end of the socketpair as a `UnixStream`.
-//!   - Parent's `Drop` closes the socket → daemon's `read()` returns 0 → exit.
-//!   - We `wait()` the child to reap the zombie.
+//!   - `Daemon::spawn()` does `socketpair()` then fork+execs the daemon binary
+//!     with `NYXSTONE_TCD_FD={child_fd}` in env.  `FD_CLOEXEC` is cleared on the
+//!     child fd from inside the child (`pre_exec`), so the fd survives exec
+//!     without ever appearing cleared in the parent's fd table — otherwise a
+//!     concurrent thread's fork+exec could inherit and leak it.
+//!   - The daemon serves requests until its `read()` returns EOF, then exits.
+//!   - `Drop` shuts the socket down → daemon `read()` returns 0 → daemon exits;
+//!     we then `wait()` the child to reap it.
+//!   - If the whole process dies (crash, kill -9, normal exit) the OS closes
+//!     the socket fd → daemon gets EOF and exits, reaped by init.
+//!
+//! We deliberately do NOT use `PR_SET_PDEATHSIG`: on Linux it fires when the
+//! parent *thread* terminates, not the parent process.  A daemon spawned on a
+//! short-lived worker thread (parallel test runners, thread pools, or any
+//! instance cached past the thread that created it) would then be killed while
+//! still in use, surfacing as "Broken pipe" / "Connection reset by peer".  The
+//! socket-EOF lifecycle above is correctly process-scoped.
 
 use std::env;
 use std::io;
@@ -133,39 +142,35 @@ fn locate_daemon() -> io::Result<PathBuf> {
 }
 
 fn spawn_with(bin: &Path) -> io::Result<Daemon> {
-    // Connected socket pair.
+    // Connected socket pair.  Both ends are FD_CLOEXEC by default; we keep the
+    // parent end CLOEXEC and clear the child end's flag inside the child only
+    // (see pre_exec below).
     let (parent, child) = UnixStream::pair()?;
-
-    // The child end must NOT have FD_CLOEXEC so it survives exec().
     let child_fd: RawFd = child.into_raw_fd();
-    unsafe {
-        let flags = libc::fcntl(child_fd, libc::F_GETFD);
-        if flags < 0 {
-            libc::close(child_fd);
-            return Err(io::Error::last_os_error());
-        }
-        if libc::fcntl(child_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-            libc::close(child_fd);
-            return Err(io::Error::last_os_error());
-        }
-    }
 
     let mut cmd = Command::new(bin);
-    cmd.env("NYXSTONE_TCD_FD",     child_fd.to_string());
-    cmd.env("NYXSTONE_TCD_PDEATH", "1");
+    cmd.env("NYXSTONE_TCD_FD", child_fd.to_string());
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     // Leave stderr inherited so user sees daemon-side panics during dev.
 
-    // Belt-and-braces: set PR_SET_PDEATHSIG *before* exec from the parent
-    // side too, in case the daemon binary doesn't honour the env var.
+    // After fork, before exec, clear FD_CLOEXEC on the inherited socket so it
+    // survives the exec.  Doing this here (child-side) rather than in the
+    // parent avoids a race: were the flag cleared in the parent's fd table, a
+    // concurrent thread spawning its own daemon could fork in that window and
+    // leak this fd into an unrelated child.  Keeping it CLOEXEC in the parent
+    // means no other spawn ever inherits it.
+    //
+    // Note: no PR_SET_PDEATHSIG — it is parent-*thread*-scoped on Linux and
+    // would kill a still-in-use daemon when the spawning thread exits.  The
+    // daemon instead exits on socket EOF (Drop, or the OS closing the fd when
+    // the process dies), which is process-scoped.
     unsafe {
-        cmd.pre_exec(|| {
-            #[cfg(target_os = "linux")]
-            {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+        cmd.pre_exec(move || {
+            let flags = libc::fcntl(child_fd, libc::F_GETFD);
+            if flags < 0 { return Err(io::Error::last_os_error()); }
+            if libc::fcntl(child_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(io::Error::last_os_error());
             }
             Ok(())
         });

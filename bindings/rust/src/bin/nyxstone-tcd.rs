@@ -7,11 +7,13 @@
 //! process-wide, and serves strict FIFO.
 //!
 //! Lifecycle:
-//!   - On exec, optionally installs `PR_SET_PDEATHSIG(SIGTERM)` (env-gated).
 //!   - Initializes the in-process gas instance (one-time per process).
 //!   - Writes the handshake bytes the client validates.
 //!   - Loops: read request frame → dispatch → write response frame.
-//!   - Exits cleanly when the client closes its socket end (read EOF).
+//!   - Exits cleanly when the client closes its socket end (read EOF), which
+//!     also covers the parent process dying (the OS closes the fd).  We do not
+//!     use PR_SET_PDEATHSIG: it is parent-thread-scoped on Linux and would kill
+//!     the daemon when the spawning thread exits while the client lives on.
 
 use std::env;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -24,15 +26,6 @@ use nyxstone_tricore_gcc_ipc::protocol::{
 };
 
 fn main() {
-    // Optional: kernel-managed lifetime, die when parent does.
-    #[cfg(target_os = "linux")]
-    if env::var("NYXSTONE_TCD_PDEATH").as_deref() == Ok("1") {
-        unsafe {
-            libc::prctl(libc::PR_SET_PDEATHSIG,
-                        libc::SIGTERM as libc::c_ulong, 0, 0, 0);
-        }
-    }
-
     // Resolve the inherited socket FD.
     let fd: i32 = match env::var("NYXSTONE_TCD_FD") {
         Ok(s) => match s.parse() {

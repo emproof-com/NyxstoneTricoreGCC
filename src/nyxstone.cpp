@@ -44,6 +44,7 @@ void   nyxstone_glue_md_assemble (char *line);
 void   nyxstone_glue_emit_bytes (const uint8_t *p, size_t n);
 size_t nyxstone_glue_frag_now_fix (void);
 int    nyxstone_glue_resolve_text_fixups (void);
+const char *nyxstone_glue_unsupported_reloc (void);
 size_t nyxstone_glue_extract_text_bytes (uint8_t *out, size_t cap);
 int    nyxstone_glue_had_errors (void);
 int    nyxstone_glue_disasm_one (const uint8_t *bytes, size_t len, uint64_t addr,
@@ -334,6 +335,11 @@ tl::expected<AssembleCore, std::string> do_assemble(
             "assemble: directive switches active section (only .text is allowed)");
 
     nyxstone_glue_resolve_text_fixups();
+
+    if (const char* bad = nyxstone_glue_unsupported_reloc())
+        return tl::make_unexpected(
+            std::string("assemble: unsupported relocation ") + bad
+            + " (local branch displacement could not be encoded)");
 
     AssembleCore result;
     size_t n = nyxstone_glue_extract_text_bytes(nullptr, 0);

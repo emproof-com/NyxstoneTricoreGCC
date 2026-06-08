@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <string>
 #include <vector>
@@ -45,6 +46,15 @@ std::string hex(const std::vector<uint8_t>& v) {
     for (auto x : v) { std::snprintf(b, sizeof(b), "%02x ", x); s += b; }
     if (!s.empty()) s.pop_back();
     return s;
+}
+
+// Extract the absolute branch target from a disassembled instruction such as
+// "j 0x1064" or "jeq %d15,0,0x1008": the last 0x... token.  Returns -1 if the
+// text has no hex literal (i.e. not an address-bearing instruction).
+long branch_target(const std::string& asm_text) {
+    auto p = asm_text.rfind("0x");
+    if (p == std::string::npos) return -1;
+    return static_cast<long>(std::strtoull(asm_text.c_str() + p + 2, nullptr, 16));
 }
 
 inline std::vector<uint8_t> B(std::initializer_list<int> il) {
@@ -108,10 +118,18 @@ const std::vector<Test> TESTS = {
     // -------------------------------------------------------------------------
     // label, forward / backward / multi / naming (12 tests).
     // -------------------------------------------------------------------------
-    {"label", "fwd j",                 "start: nop; j here; here: ret\n",                   BYTES, B({0x00, 0x00, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x90})},
-    {"label", "fwd j with addrs",      ".L0:\n nop\n j .L1\n .L1:\n nop\n ret\n",           BYTES, B({0x00, 0x00, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90})},
-    {"label", "back j short",          "loop: nop; j loop\n",                               BYTES, B({0x00, 0x00, 0x1d, 0x00, 0x00, 0x00})},
-    {"label", "back jeq",              "loop: nop; nop; jeq %d15, 0, loop\n",               BYTES, B({0x00, 0x00, 0x00, 0x00, 0xdf, 0x0f, 0x00, 0x00})},
+    // Local (same-section) branches relax to their 2-byte short form (opcode
+    // 0x3c) and carry the correct PC-relative displacement: `j here` targets
+    // the next insn (disp 0x01), `j loop` jumps back one insn (disp 0xff = -1).
+    {"label", "fwd j",                 "start: nop; j here; here: ret\n",                   BYTES, B({0x00, 0x00, 0x3c, 0x01, 0x00, 0x90})},
+    {"label", "fwd j with addrs",      ".L0:\n nop\n j .L1\n .L1:\n nop\n ret\n",           BYTES, B({0x00, 0x00, 0x3c, 0x01, 0x00, 0x00, 0x00, 0x90})},
+    {"label", "back j short",          "loop: nop; j loop\n",                               BYTES, B({0x00, 0x00, 0x3c, 0xff})},
+    // Relaxation holds across a real distance and on either side of the label:
+    // a same-section `j` is the 2-byte short form (opcode 0x3c) whether the
+    // target sits before or after the branch, with surrounding insns intact.
+    {"relax", "back j over distance",  "a:\n nop\n nop\n j a\n",                             BYTES, B({0x00, 0x00, 0x00, 0x00, 0x3c, 0xfe})},
+    {"relax", "fwd j over distance",   "j t\n nop\n nop\nt:\n ret\n",                        BYTES, B({0x3c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90})},
+    {"label", "back jeq",              "loop: nop; nop; jeq %d15, 0, loop\n",               BYTES, B({0x00, 0x00, 0x00, 0x00, 0xdf, 0x0f, 0xfe, 0x7f})},
     {"label", "lone label then insn",  "foo:\n bar:\n nop\n",                               BYTES, B({0x00, 0x00})},
     {"label", "two labels same line",  "a: b: nop\n",                                       BYTES, B({0x00, 0x00})},
     {"label", "dot-prefix .L0",        ".L0: nop\n",                                        BYTES, B({0x00, 0x00})},
@@ -439,12 +457,55 @@ int main() {
     }
     std::printf("  %d internal-label pass, %d fail\n", wri_pass, wri_fail);
 
-    int extra_fail = el_fail + ai_fail + dc_fail + wr_fail + air_fail + wri_fail;
+    // Branch displacement / relative references: a local branch must encode a
+    // displacement that actually targets the referenced label.  We verify by
+    // disassembling and checking the recovered target address equals the
+    // address of the instruction the label denotes, across forward/backward
+    // references, several distances, and several branch kinds.  The label is
+    // always either the first instruction (backward refs) or the last
+    // (forward refs), so its address is unambiguous from the decoded stream.
+    std::printf("\n--- branch displacement (relative references) ---\n");
+    int bd_pass = 0, bd_fail = 0;
+    {
+        const uint64_t base = 0x100000;  // away from 0 so a self-target stands out
+        struct BD { const char* name; const char* src; bool fwd; };
+        const BD bds[] = {
+            {"j   fwd  +1 insn", "j l\n nop\nl: ret\n",                          true},
+            {"j   fwd  +3 insn", "j l\n nop\n nop\n nop\nl: ret\n",              true},
+            {"jl  fwd  +2 insn", "jl l\n nop\n nop\nl: ret\n",                   true},
+            {"call fwd +2 insn", "call l\n nop\n nop\nl: ret\n",                 true},
+            {"jeq fwd  +2 insn", "jeq %d15, 0, l\n nop\n nop\nl: ret\n",         true},
+            {"jne fwd  +2 insn", "jne %d15, 0, l\n nop\n nop\nl: ret\n",         true},
+            {"j   back -1 insn", "l: nop\n j l\n",                               false},
+            {"j   back -3 insn", "l: nop\n nop\n nop\n j l\n",                   false},
+            {"jeq back -2 insn", "l: nop\n nop\n jeq %d15, 0, l\n",              false},
+            {"loop back",        "l: nop\n nop\n loop %a2, l\n",                 false},
+        };
+        for (const auto& bd : bds) {
+            auto o = a.assemble(bd.src, base, {});
+            if (!o) { std::printf("  FAIL  [%s] assemble: %s\n", bd.name, o.error().c_str()); ++bd_fail; continue; }
+            auto v = a.disassemble_to_instructions(*o, base, 0);
+            if (!v || v->empty()) { std::printf("  FAIL  [%s] disassemble failed\n", bd.name); ++bd_fail; continue; }
+            const auto& branch = bd.fwd ? v->front() : v->back();
+            uint64_t want   = bd.fwd ? v->back().address : v->front().address;
+            long     got    = branch_target(branch.assembly);
+            if (static_cast<long>(want) == got) {
+                ++bd_pass;
+            } else {
+                std::printf("  FAIL  [%s] target 0x%lx, expected 0x%lx  (%s)\n",
+                            bd.name, got, (unsigned long)want, branch.assembly.c_str());
+                ++bd_fail;
+            }
+        }
+    }
+    std::printf("  %d branch-displacement pass, %d fail\n", bd_pass, bd_fail);
+
+    int extra_fail = el_fail + ai_fail + dc_fail + wr_fail + air_fail + wri_fail + bd_fail;
     std::printf("\nSummary: %d passed, %d failed, %d drifts (of %zu tests); "
                 "%d disasm round-trips passed, %d failed; "
                 "%d additional API checks passed, %d failed\n",
                 r.passed, r.failed, r.drift, TESTS.size(), rt_pass, rt_fail,
-                el_pass + ai_pass + dc_pass + wr_pass + air_pass + wri_pass,
+                el_pass + ai_pass + dc_pass + wr_pass + air_pass + wri_pass + bd_pass,
                 extra_fail);
     return (r.failed == 0 && r.drift == 0 && rt_fail == 0 && extra_fail == 0) ? 0 : 1;
 }
