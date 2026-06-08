@@ -42,6 +42,7 @@ extern void     symbol_begin (void);
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <inttypes.h>
 
 extern void md_begin (void);
 extern void md_assemble (char *);
@@ -383,6 +384,15 @@ static int dis_printf_styled (void *s, enum disassembler_style style, const char
     return n;
 }
 
+/* Print a branch/call target address WITHOUT the zero-padding that the
+   default generic_print_address (bfd_sprintf_vma -> "%08lx") applies.
+   Mirrors objdump's objdump_print_value, which strips leading zeros, so
+   we emit "j 0x1068" instead of "j 0x00001068".  Routes through the same
+   fprintf_func so the text lands in the same output buffer. */
+static void dis_print_address (bfd_vma addr, struct disassemble_info *info) {
+    (*info->fprintf_func) (info->stream, "0x%" PRIx64, (uint64_t) addr);
+}
+
 /* Disassemble one instruction starting at byte offset 0 of `bytes`/`len`.
    Returns the number of bytes consumed (2 or 4), or <=0 on failure.  On
    success, *text_out points to a freshly malloc'd null-terminated string
@@ -406,6 +416,9 @@ int nyxstone_glue_disasm_one (const uint8_t *bytes, size_t len, uint64_t addr,
     info.buffer_vma    = addr;
     info.buffer_length = len;
     info.read_memory_func = buffer_read_memory;
+    /* Override the default generic_print_address so branch/call targets are
+       printed without zero-padding, matching objdump (e.g. "j 0x1068"). */
+    info.print_address_func = dis_print_address;
 
     int n = print_insn_tricore ((unsigned long) addr, &info);
     if (n <= 0) {
