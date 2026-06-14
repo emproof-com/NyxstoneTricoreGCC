@@ -117,6 +117,11 @@ public:
     /// Does not support assembly directives that change the active section
     /// (e.g. `.section`, `.pushsection`, `.data`, `.bss`); .text-only.
     ///
+    /// A reference to a label that is neither defined in @p assembly nor
+    /// supplied via @p labels is an error (the message lists the undefined
+    /// names).  Error strings embed gas's own diagnostics; nothing is
+    /// printed to the process's stderr.
+    ///
     /// @param assembly The assembly instruction(s) to be assembled.
     /// @param address  The absolute address of the first instruction.
     /// @param labels   External label definitions used by @p assembly.
@@ -144,10 +149,15 @@ public:
     /// a relocation entry for each reference, the same behaviour you get
     /// from `gcc/gas -r` for a partially-linked object.
     ///
-    /// External label references in @p assembly stay as zero-valued
-    /// placeholders in the byte stream; their resolution is described by
-    /// the returned `RelocationInfo` records, whose `symbol.address` field
-    /// is populated from the matching @p labels entry (or 0 if none).
+    /// Unlike the plain paths, an undefined symbol is NOT an error here --
+    /// this is the link-later path.  External label references in
+    /// @p assembly stay as zero-valued placeholders in the byte stream
+    /// (branches keep their longest encoding so the linker has full range);
+    /// their resolution is described by the returned `RelocationInfo`
+    /// records, whose `symbol.address` field is populated from the matching
+    /// @p labels entry (or 0 if none -- @p labels is purely an informational
+    /// hint here and may be empty).  Labels defined in the source itself
+    /// resolve inline and produce no relocation entries.
     ///
     /// @return The assembled bytes plus relocations on success, an error
     ///         string otherwise.
@@ -158,6 +168,12 @@ public:
 
     /// @brief Like @ref assemble_to_instructions, but with `-r`-style
     /// relocation output (see @ref assemble_with_relocs).
+    ///
+    /// The per-instruction `assembly` text decodes the placeholder bytes,
+    /// so a relocation site prints with displacement 0 (e.g. a `j ext`
+    /// shows its own PC as target), exactly like objdump on an unlinked
+    /// object.  Correlate `Instruction.address` with the returned
+    /// relocation offsets to find the sites the linker will patch.
     tl::expected<AssembleInstructionsWithRelocsResult, std::string>
     assemble_to_instructions_with_relocs(
         const std::string& assembly,
@@ -165,6 +181,10 @@ public:
         const std::vector<LabelDefinition>& labels) const;
 
     /// @brief Translates bytes to disassembly text at a given start address.
+    ///
+    /// Undecodable input degrades to objdump-style `.byte`/`.hword` lines.
+    /// Branch/call targets are printed masked to 32 bits (TriCore's address
+    /// width), matching objdump.
     ///
     /// @param bytes   The byte code to be disassembled.
     /// @param address The absolute address of the first byte.

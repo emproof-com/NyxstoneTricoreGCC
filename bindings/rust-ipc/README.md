@@ -114,13 +114,21 @@ install options.
 
 ## How the IPC mode works
 
-- **One daemon per parent process.**  Different processes never share daemons.
+- **One daemon per `NyxstoneTricoreGCC` instance**, owned by that instance.
+  Instances (and processes) never share daemons.
 - **Lazy spawn.**  No background process unless you actually call `new()`.
-- **Process-lifetime-bound.**  On Linux, the daemon installs
-  `PR_SET_PDEATHSIG(SIGTERM)` so the kernel kills it the moment the parent
-  exits, crash, `kill -9`, normal exit, all of them.
+- **Socket-lifetime-bound.**  The daemon exits when its socket reads EOF:
+  on instance drop, or when the parent process dies for any reason (crash,
+  `kill -9`, normal exit — the OS closes the socket).  `PR_SET_PDEATHSIG`
+  is deliberately not used: it is parent-*thread*-scoped on Linux and would
+  kill a daemon whose spawning thread exited while the instance lives on.
 - **Strict FIFO.**  Calls from multiple threads serialize through a
   per-instance mutex.
+- **Timeouts + automatic respawn.**  Each request is bounded by a 30 s
+  read/write socket timeout (override with `NYXSTONE_TCD_TIMEOUT_MS`, read
+  once at instance creation; `0` disables it).  On any transport error
+  (timeout, daemon crash, connection reset) the stream is never reused: the
+  daemon is respawned once and the request retried exactly once.
 
 ## Performance
 

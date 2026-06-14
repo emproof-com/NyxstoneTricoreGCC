@@ -1,13 +1,20 @@
 // NyxstoneTricoreGCC test suite.
 //
-// 118 tests across six groups:
-//   - insn       (46): every TriCore format we exercise.
+// 155 matrix tests across eleven groups:
+//   - insn       (47): every TriCore format we exercise.
 //   - label      (12): forward/backward branches, multi-label lines,
 //                       various identifier styles, label-only sources.
-//   - data       (40): every data directive Nyxstone supports.
+//   - relax       (2): short-form selection for local branches.
+//   - data       (36): every data directive Nyxstone supports.
 //   - mixed       (4): instructions + labels + data interleaved.
 //   - edge        (9): empty / comments-only / whitespace / `;` separators.
-//   - forbid     (10): Nyxstone-style .text-only restriction.
+//   - forbid   (7+3): Nyxstone-style .text-only restriction (+ accepted).
+//   - quote       (5): `#`/`;`/`//` inside string literals.
+//   - dirsem     (13): fill operands, .equ/.set, numeric local labels,
+//                       .p2align, alignment fill/max-skip.
+//   - alignrelax  (4): .align/.org padding sized after branch relaxation.
+//   - error      (13): undefined labels, bad directives, range errors --
+//                       must reject, never emit silently wrong bytes.
 //
 // Expected bytes are embedded (no runtime gas dependency).  They were
 // captured from a known-good run cross-validated against tricore-elf-as
@@ -18,7 +25,10 @@
 //   MUST_FAIL : assemble() must return nullopt.
 //
 // After Round 1 byte-correctness, every passing test is repeated 100× to
-// catch state-reset drift across consecutive assemble() calls.
+// catch state-reset drift across consecutive assemble() calls.  Post-matrix
+// checks cover disassembly round-trips, external label resolution (exact
+// displacement bytes), relocations, branch displacement semantics, data
+// symbol references, error-message quality, and 32-bit address masking.
 
 #include "nyxstone/nyxstone.h"
 
@@ -216,6 +226,66 @@ const std::vector<Test> TESTS = {
     {"forbid-ok", ".text",             ".text\n nop\n",                       BYTES, B({0x00, 0x00})},
     {"forbid-ok", ".section .text",    ".section .text\n nop\n",              BYTES, B({0x00, 0x00})},
     {"forbid-ok", ".section .text.foo",".section .text.foo\n nop\n",          BYTES, B({0x00, 0x00})},
+
+    // -------------------------------------------------------------------------
+    // quote, the statement splitter and comment stripper must not fire
+    // inside "..." string literals.
+    // -------------------------------------------------------------------------
+    {"quote", "# inside string",       ".asciz \"a#b\"\n",                    BYTES, B({0x61, 0x23, 0x62, 0x00})},
+    {"quote", "; inside string",       ".ascii \"a;b\"\n",                    BYTES, B({0x61, 0x3b, 0x62})},
+    {"quote", "// inside string",      ".ascii \"a//b\"\n",                   BYTES, B({0x61, 0x2f, 0x2f, 0x62})},
+    {"quote", "escaped quote + #",     ".ascii \"a\\\"#\"\n",                 BYTES, B({0x61, 0x22, 0x23})},
+    {"quote", "comment after string",  ".ascii \"ab\"  # trailing\n",         BYTES, B({0x61, 0x62})},
+
+    // -------------------------------------------------------------------------
+    // dirsem, directive semantics: fill operands, .equ/.set constants,
+    // numeric local labels, .p2align, alignment fill / max-skip.
+    // -------------------------------------------------------------------------
+    {"dirsem", ".skip with fill",      ".skip 3, 0xff\n",                     BYTES, B({0xff, 0xff, 0xff})},
+    {"dirsem", ".space with fill",     ".space 2, 0x41\n",                    BYTES, B({0x41, 0x41})},
+    {"dirsem", ".zero",                ".zero 2\n",                           BYTES, B({0x00, 0x00})},
+    {"dirsem", ".equ constant",        ".equ five, 5\n mov %d0, five\n",      BYTES, B({0x82, 0x50})},
+    {"dirsem", ".set constant",        ".set six, 6\n mov %d0, six\n",        BYTES, B({0x82, 0x60})},
+    {"dirsem", ".equ forward label",   ".equ tgt, after\n j tgt\nafter: nop\n", BYTES, B({0x1d, 0x00, 0x02, 0x00, 0x00, 0x00})},
+    {"dirsem", "numeric label back",   "1: nop\n j 1b\n",                     BYTES, B({0x00, 0x00, 0x3c, 0xff})},
+    {"dirsem", "numeric label fwd",    "j 1f\n nop\n1: ret\n",                BYTES, B({0x3c, 0x02, 0x00, 0x00, 0x00, 0x90})},
+    {"dirsem", "numeric label reuse",  "1: nop\n j 1b\n1: ret\n j 1b\n",      BYTES, B({0x00, 0x00, 0x3c, 0xff, 0x00, 0x90, 0x3c, 0xff})},
+    {"dirsem", ".p2align",             ".byte 1\n .p2align 2\n .byte 2\n",    BYTES, B({0x01, 0x00, 0x00, 0x00, 0x02})},
+    {"dirsem", ".align fill",          ".byte 1\n .align 2, 0xaa\n .byte 2\n", BYTES, B({0x01, 0xaa, 0xaa, 0xaa, 0x02})},
+    {"dirsem", ".align max-skip",      ".byte 1\n .align 2, 0, 1\n .byte 2\n", BYTES, B({0x01, 0x02})},
+    {"dirsem", ".balign",              ".byte 1\n .balign 4\n .byte 2\n",     BYTES, B({0x01, 0x00, 0x00, 0x00, 0x02})},
+
+    // -------------------------------------------------------------------------
+    // alignrelax, .align/.org sized AFTER branch relaxation: a branch frag
+    // before the directive used to make the padding silently wrong (computed
+    // from parse-time offsets in the wrong frag).
+    // -------------------------------------------------------------------------
+    {"alignrelax", ".align after relaxed j", "start: nop\n j start\n .align 3\n ret\n",
+        BYTES, B({0x00, 0x00, 0x3c, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90})},
+    {"alignrelax", ".org after relaxed j",   "start: nop\n j start\n .org 8\n ret\n",
+        BYTES, B({0x00, 0x00, 0x3c, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90})},
+    {"alignrelax", "fwd j over .align",      "j t\n nop\n .align 3\nt: ret\n",
+        BYTES, B({0x3c, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90})},
+    {"alignrelax", ".org exact (no pad)",    "nop\n nop\n .org 4\n ret\n",
+        BYTES, B({0x00, 0x00, 0x00, 0x00, 0x00, 0x90})},
+
+    // -------------------------------------------------------------------------
+    // error, inputs that must be rejected instead of producing silently
+    // wrong bytes (message content is asserted separately below).
+    // -------------------------------------------------------------------------
+    {"error", "undefined label",       "j nowhere_defined\n",                 MUST_FAIL, {}},
+    {"error", "undefined data symbol", ".word nowhere_defined\n",             MUST_FAIL, {}},
+    {"error", "unknown directive",     ".frobnicate 1, 2\n",                  MUST_FAIL, {}},
+    {"error", "unknown mnemonic",      "frobnicate %d0\n",                    MUST_FAIL, {}},
+    {"error", "duplicate label",       "x: nop\nx: ret\n",                    MUST_FAIL, {}},
+    {"error", ".org backwards",        "nop\n nop\n .org 2\n ret\n",          MUST_FAIL, {}},
+    {"error", ".balign non-pow2",      ".balign 3\n",                         MUST_FAIL, {}},
+    {"error", ".align exponent range", ".align 31\n",                         MUST_FAIL, {}},
+    {"error", ".skip negative",        ".skip -1\n",                          MUST_FAIL, {}},
+    {"error", ".ascii non-string",     ".ascii 5\n",                          MUST_FAIL, {}},
+    {"error", ".ascii unterminated",   ".ascii \"abc\n",                      MUST_FAIL, {}},
+    {"error", ".equ missing operand",  ".equ five\n",                         MUST_FAIL, {}},
+    {"error", "imm out of range",      "mov %d0, 0x123456\n",                 MUST_FAIL, {}},
 };
 
 struct Result { int passed = 0; int failed = 0; int drift = 0; };
@@ -269,8 +339,10 @@ int main() {
 
     // 100x stress, catches state-reset drift.
     std::printf("\n--- 100x stress (each non-MUST_FAIL test 100 iterations) ---\n");
+    size_t stress_n = 0;
     for (auto& t : TESTS) {
         if (t.mode == MUST_FAIL) continue;
+        ++stress_n;
         std::vector<uint8_t> last;
         bool ok = true;
         for (int k = 0; k < 100; ++k) {
@@ -285,7 +357,7 @@ int main() {
         }
     }
     if (r.drift == 0) std::printf("  PASS: no drift across %zu non-fail tests * 100 iterations\n",
-                                   TESTS.size());
+                                   stress_n);
 
     // Round-trip: every BYTES test that produced ≥2 bytes must disassemble
     // cleanly (we just check we don't crash and get the right number of
@@ -318,26 +390,38 @@ int main() {
     std::printf("\n--- external label resolution ---\n");
     int el_pass = 0, el_fail = 0;
     {
-        // ext is 8 bytes ahead of address 0x1000.  External labels resolve as
-        // absolute symbols, so gas picks the 4-byte j form: 6 nop + 4 j = 10.
+        // ext is 8 bytes ahead of address 0x1000.  External labels stay in
+        // the longest (value-independent) branch form: 6 nop + 4-byte j = 10.
+        // The j sits at 0x1006, so disp = (0x1008 - 0x1006) / 2 = 1, encoded
+        // in B-format as 1d 00 01 00.  Asserting the exact displacement
+        // bytes is the point: a regression that silently encodes 0 must not
+        // pass on size alone.
+        const std::vector<uint8_t> expect =
+            {0x00,0x00, 0x00,0x00, 0x00,0x00, 0x1d,0x00,0x01,0x00};
         auto o = a.assemble("nop\n nop\n nop\n j ext\n",
                             /*address=*/0x1000,
                             /*labels=*/{{"ext", 0x1008}});
         if (!o) {
             std::printf("  FAIL  external 0x1000 → 0x1008: %s\n", o.error().c_str());
             ++el_fail;
-        } else if (o->size() != 10) {
-            std::printf("  FAIL  external 0x1000 → 0x1008: size %zu (expected 10)\n", o->size());
+        } else if (*o != expect) {
+            std::printf("  FAIL  external 0x1000 → 0x1008: got %s\n", hex(*o).c_str());
             ++el_fail;
         } else {
             ++el_pass;
         }
         // Address invariance: the same source with (address=0, ext=0x8) and
-        // (address=0x1000, ext=0x1008) must produce identical bytes, they
-        // both encode `.equ ext, 0x8` internally.
+        // (address=0x1000, ext=0x1008) must produce identical bytes; the
+        // displacement (label - PC) is the same in both cases and the
+        // branch form does not depend on the absolute value.
         auto o2 = a.assemble("nop\n nop\n nop\n j ext\n", 0, {{"ext", 0x8}});
         if (o && o2 && *o == *o2) ++el_pass;
         else { std::printf("  FAIL  external-label address invariance\n"); ++el_fail; }
+        // A label far away resolves with the full 24-bit displacement.
+        auto o3 = a.assemble_to_instructions("j ext\n", 0x1000, {{"ext", 0x2000}});
+        if (o3 && o3->size() == 1
+            && o3->front().assembly.find("0x2000") != std::string::npos) ++el_pass;
+        else { std::printf("  FAIL  external far target not encoded\n"); ++el_fail; }
     }
     std::printf("  %d external-label pass, %d fail\n", el_pass, el_fail);
 
@@ -409,11 +493,14 @@ int main() {
                 } else ++wr_pass;
             }
         }
-        // Unlisted symbol → reloc with symbol.address == 0.
+        // Unlisted symbol → NOT an error (unlike the plain path, which
+        // rejects undefined labels): the reference comes back as a reloc
+        // entry with symbol.address == 0 for the linker to resolve.
         auto r2 = a.assemble_with_relocs("j foobar\n", 0, {});
         if (!r2 || r2->relocations.size() != 1
             || r2->relocations[0].symbol.name != "foobar"
-            || r2->relocations[0].symbol.address != 0) {
+            || r2->relocations[0].symbol.address != 0
+            || r2->relocations[0].relocation_type != 3 /* R_TRICORE_24REL */) {
             std::printf("  FAIL  unlisted symbol case\n");
             ++wr_fail;
         } else ++wr_pass;
@@ -500,12 +587,90 @@ int main() {
     }
     std::printf("  %d branch-displacement pass, %d fail\n", bd_pass, bd_fail);
 
-    int extra_fail = el_fail + ai_fail + dc_fail + wr_fail + air_fail + wri_fail + bd_fail;
+    // Data directives referencing symbols/expressions: must emit the right
+    // bytes (a local label's absolute address, or a folded label difference)
+    // instead of being silently dropped.
+    std::printf("\n--- data symbol references ---\n");
+    int ds_pass = 0, ds_fail = 0;
+    {
+        struct DS { const char* name; const char* src; uint64_t base;
+                    size_t at; std::vector<uint8_t> want; };
+        const DS cases[] = {
+            {"word local",  "start: nop\n .word here\nhere: ret\n", 0x1000, 2, {0x06,0x10,0x00,0x00}},
+            {"word diff",   "a: nop\n nop\nb: .word b - a\n",        0x1000, 4, {0x04,0x00,0x00,0x00}},
+            {"short local", "l: nop\n .short l\n",                   0x1000, 2, {0x00,0x10}},
+            {"byte local",  "l: nop\n .byte l\n",                    0x40,   2, {0x40}},
+            {"word literal", ".word 0x11223344\n",                   0,      0, {0x44,0x33,0x22,0x11}},
+        };
+        for (const auto& c : cases) {
+            auto o = a.assemble(c.src, c.base, {});
+            if (!o) { std::printf("  FAIL  [%s] %s\n", c.name, o.error().c_str()); ++ds_fail; continue; }
+            bool ok = o->size() >= c.at + c.want.size();
+            for (size_t i = 0; ok && i < c.want.size(); ++i) ok = (*o)[c.at + i] == c.want[i];
+            if (ok) ++ds_pass;
+            else { std::printf("  FAIL  [%s] got %s\n", c.name, hex(*o).c_str()); ++ds_fail; }
+        }
+    }
+    std::printf("  %d data-symbol-reference pass, %d fail\n", ds_pass, ds_fail);
+
+    // Error-message quality: failures must carry the gas diagnostic / the
+    // offending symbol name, not a generic string (and nothing may leak to
+    // the host stderr -- gas output is captured into the error channel).
+    std::printf("\n--- error message quality ---\n");
+    int em_pass = 0, em_fail = 0;
+    {
+        struct EM { const char* name; const char* src; const char* expect_substr; };
+        const EM cases[] = {
+            {"undefined label names symbol", "j nowhere_defined\n",  "nowhere_defined"},
+            {"gas diagnostic propagated",    "frobnicate %d0\n",     "Unknown instruction"},
+            {"duplicate label diagnostic",   "x: nop\nx: ret\n",     "already defined"},
+            {"unknown directive named",      ".frobnicate\n",        "unsupported directive '.frobnicate'"},
+            {".org backwards diagnostic",    "nop\nnop\n.org 2\n",   ".org backwards"},
+            {"section violation phrase",     ".data\n",              "only .text is allowed"},
+        };
+        for (const auto& c : cases) {
+            auto o = a.assemble(c.src, 0, {});
+            if (o) { std::printf("  FAIL  [%s] unexpectedly assembled\n", c.name); ++em_fail; continue; }
+            if (o.error().find(c.expect_substr) == std::string::npos) {
+                std::printf("  FAIL  [%s] error lacks \"%s\": %s\n",
+                            c.name, c.expect_substr, o.error().c_str());
+                ++em_fail;
+            } else ++em_pass;
+        }
+        // Conflict between a source label and a LabelDefinition of the same
+        // name must be reported, not silently resolved either way.
+        auto o = a.assemble("dup: nop\n j dup\n", 0x1000, {{"dup", 0x2000}});
+        if (!o && o.error().find("dup") != std::string::npos) ++em_pass;
+        else { std::printf("  FAIL  source+LabelDefinition conflict not reported\n"); ++em_fail; }
+    }
+    std::printf("  %d error-message pass, %d fail\n", em_pass, em_fail);
+
+    // Disassembly address masking: TriCore is 32-bit; branch targets print
+    // masked to 32 bits like objdump (0xfffffffe, never a sign-extended
+    // 64-bit value).
+    std::printf("\n--- disassembly address masking ---\n");
+    int am_pass = 0, am_fail = 0;
+    {
+        auto v = a.disassemble_to_instructions({0xff, 0xff, 0xff, 0xff}, 0, 0);
+        if (v && v->size() == 1
+            && v->front().assembly.find("0xfffffffe") != std::string::npos
+            && v->front().assembly.find("0xffffffffffff") == std::string::npos) ++am_pass;
+        else {
+            std::printf("  FAIL  expected masked 0xfffffffe target, got: %s\n",
+                        v ? v->front().assembly.c_str() : v.error().c_str());
+            ++am_fail;
+        }
+    }
+    std::printf("  %d address-masking pass, %d fail\n", am_pass, am_fail);
+
+    int extra_fail = el_fail + ai_fail + dc_fail + wr_fail + air_fail + wri_fail + bd_fail + ds_fail
+                   + em_fail + am_fail;
     std::printf("\nSummary: %d passed, %d failed, %d drifts (of %zu tests); "
                 "%d disasm round-trips passed, %d failed; "
                 "%d additional API checks passed, %d failed\n",
                 r.passed, r.failed, r.drift, TESTS.size(), rt_pass, rt_fail,
-                el_pass + ai_pass + dc_pass + wr_pass + air_pass + wri_pass + bd_pass,
+                el_pass + ai_pass + dc_pass + wr_pass + air_pass + wri_pass + bd_pass + ds_pass
+                + em_pass + am_pass,
                 extra_fail);
     return (r.failed == 0 && r.drift == 0 && rt_fail == 0 && extra_fail == 0) ? 0 : 1;
 }

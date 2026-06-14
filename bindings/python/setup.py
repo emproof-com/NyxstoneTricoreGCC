@@ -1,160 +1,59 @@
-"""setup.py, compiles the CFFI extension self-contained.
+"""setup.py -- builds the CFFI extension via the standard `cffi_modules` hook.
 
-Everything (C++ wrapper sources, headers, binutils-tricore prebuilt tarballs)
-lives under `nyxstone-tricore-gcc/` as a symlink view of the top-level repo,
-which setuptools follows when building both sdist and wheels.  No external
-`make` step is required.
+The FFI declaration and source layout live in build_native.py; cffi turns it
+into a proper setuptools Extension, so wheels come out platform-tagged and
+contain the compiled `nyxstone_tricore_gcc._native` module.
 
-Build flow:
-  1. Pick host arch + PIC variant.
-  2. Extract the matching binutils-tricore prebuilt tarballs into build/.
-  3. Have CFFI compile our C++/C wrapper TUs + link binutils archives + every
-     gas .o file in one shot.
+Build flow (all inside the build_ext step, so metadata-only PEP 517 hooks
+never do heavy work):
+  1. Extract the matching binutils-tricore prebuilt tarballs into
+     build/binutils-tricore/ (host arch + PIC variant).
+  2. Inject the extracted gas .o files into the extension's extra_objects.
+  3. Compile our C++/C wrapper TUs (-std=c++17 for the C++ ones only) and
+     link the binutils archives in one shot.
 """
 
-import glob
 import os
-import platform
-import shutil
-import subprocess
 import sys
-from pathlib import Path
 
 from setuptools import setup
-from cffi import FFI
+from setuptools.command.build_ext import build_ext as _build_ext
 
-HERE = Path(__file__).resolve().parent
-ROOT = HERE / "nyxstone-tricore-gcc"           # symlink view of the repo
-PREBUILT = ROOT / "binutils-prebuilt"
-
-# ----- 1. Choose prebuilt variant ------------------------------------------
-_ARCH_MAP = {
-    "x86_64":  "x86_64-linux-gnu",
-    "aarch64": "aarch64-linux-gnu",
-    "arm64":   "aarch64-linux-gnu",
-}
-arch = _ARCH_MAP.get(platform.machine())
-if arch is None:
-    sys.stderr.write(
-        f"ERROR: no bundled binutils-tricore prebuilt for host '{platform.machine()}'.\n"
-        f"  Supported: {sorted(set(_ARCH_MAP.values()))}\n"
-        f"  Other arches: build from source and set NYX_EXTRACTED_DIR.\n")
-    sys.exit(1)
-
-# Python's CFFI extension is loaded as a shared object, so we need the PIC
-# variant unless the caller explicitly opts out.
-variant = "nopic" if os.environ.get("NYX_BINUTILS_PIC") == "0" else "pic"
-
-# ----- 2. Extract prebuilts ------------------------------------------------
-EXTRACTED = Path(os.environ.get(
-    "NYX_EXTRACTED_DIR",
-    HERE / "build" / "binutils-tricore"))
+# Make build_native importable regardless of how the build frontend runs us.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import build_native  # noqa: E402
 
 
-def _extract(tar_xz: Path, dst: Path) -> None:
-    dst.mkdir(parents=True, exist_ok=True)
-    subprocess.check_call(["tar", "-C", str(dst), "-xf", str(tar_xz)])
+class nyx_build_ext(_build_ext):
+    """Extract the bundled prebuilts and finalize link inputs at build time.
+
+    cffi's `cffi_modules` machinery wraps this class: it first generates the
+    _native C source into build_temp, then delegates to run() below."""
+
+    def run(self):
+        build_native.extract_prebuilts()
+        for ext in self.extensions:
+            if ext.name == "nyxstone_tricore_gcc._native":
+                ext.extra_objects = build_native.gas_objects()
+        super().run()
+
+    def build_extensions(self):
+        # The wrapper TUs are C++17, but distutils passes extra_compile_args
+        # to every source, and -std=c++17 errors out on the .c file.  Wrap
+        # the per-source compile hook to add it for C++ sources only.
+        orig_compile = self.compiler._compile
+
+        def _compile(obj, src, ext, cc_args, extra_postargs, pp_opts):
+            postargs = list(extra_postargs)
+            if src.endswith((".cpp", ".cc", ".cxx")):
+                postargs.append("-std=c++17")
+            return orig_compile(obj, src, ext, cc_args, postargs, pp_opts)
+
+        self.compiler._compile = _compile
+        super().build_extensions()
 
 
-if "NYX_EXTRACTED_DIR" not in os.environ:
-    if EXTRACTED.exists():
-        shutil.rmtree(EXTRACTED)
-    _extract(PREBUILT / "headers-shared.tar.xz",                EXTRACTED)
-    _extract(PREBUILT / arch / "headers-arch.tar.xz",           EXTRACTED)
-    _extract(PREBUILT / arch / variant / "lib.tar.xz",          EXTRACTED)
-
-# ----- 3. Locate everything CFFI needs to compile + link -------------------
-INCLUDE_DIRS = [
-    str(ROOT / "c_api"),
-    str(ROOT / "include"),
-    str(EXTRACTED / "include"),
-    str(EXTRACTED / "binutils-include"),
-    str(EXTRACTED / "gas-internal-headers"),
-    str(EXTRACTED / "gas-internal-headers/config"),
-    str(EXTRACTED / "gas-internal-headers-build"),
-    str(EXTRACTED / "bfd-internal-headers"),
-    str(EXTRACTED / "bfd-internal-headers-build"),
-    str(EXTRACTED),                                # resolves "bfd/elf-bfd.h"
-]
-SOURCES = [
-    str(ROOT / "src/nyxstone.cpp"),
-    str(ROOT / "src/nyxstone_glue.c"),
-    str(ROOT / "src/nyxstone_c.cpp"),
-]
-gas_objs = sorted(glob.glob(str(EXTRACTED / "lib/gas/*.o")) +
-                  glob.glob(str(EXTRACTED / "lib/gas/config/*.o")))
-
-# ----- 4. Hand-written cdef (CFFI parser chokes on the real header) --------
-ffibuilder = FFI()
-ffibuilder.cdef("""
-typedef struct nyxstone_handle nyxstone_handle_t;
-
-typedef struct {
-    const char* name;
-    uint64_t    address;
-} nyxstone_label_def_t;
-
-typedef struct {
-    uint64_t  address;
-    char*     assembly;
-    uint8_t*  bytes;
-    size_t    bytes_len;
-} nyxstone_instruction_t;
-
-typedef struct {
-    char*    name;
-    uint64_t address;
-} nyxstone_reloc_symbol_t;
-
-typedef struct {
-    uint64_t            offset;
-    int64_t             addend;
-    int                 has_addend;
-    nyxstone_reloc_symbol_t  symbol;
-    uint32_t            relocation_type;
-} nyxstone_reloc_t;
-
-nyxstone_handle_t* nyxstone_create(char**);
-void                        nyxstone_destroy(nyxstone_handle_t*);
-
-int nyxstone_assemble(nyxstone_handle_t*, const char*, size_t,
-                 uint64_t, const nyxstone_label_def_t*, size_t,
-                 uint8_t**, size_t*, char**);
-int nyxstone_assemble_to_instructions(nyxstone_handle_t*, const char*, size_t,
-                                 uint64_t, const nyxstone_label_def_t*, size_t,
-                                 nyxstone_instruction_t**, size_t*, char**);
-int nyxstone_assemble_with_relocs(nyxstone_handle_t*, const char*, size_t,
-                             uint64_t, const nyxstone_label_def_t*, size_t,
-                             uint8_t**, size_t*, nyxstone_reloc_t**, size_t*, char**);
-int nyxstone_assemble_to_instructions_with_relocs(nyxstone_handle_t*, const char*, size_t,
-                                             uint64_t, const nyxstone_label_def_t*, size_t,
-                                             nyxstone_instruction_t**, size_t*,
-                                             nyxstone_reloc_t**, size_t*, char**);
-int nyxstone_disassemble(nyxstone_handle_t*, const uint8_t*, size_t,
-                    uint64_t, size_t, char**, char**);
-int nyxstone_disassemble_to_instructions(nyxstone_handle_t*, const uint8_t*, size_t,
-                                    uint64_t, size_t,
-                                    nyxstone_instruction_t**, size_t*, char**);
-
-void nyxstone_free_bytes(uint8_t*);
-void nyxstone_free_string(char*);
-void nyxstone_free_instructions(nyxstone_instruction_t*, size_t);
-void nyxstone_free_relocations(nyxstone_reloc_t*, size_t);
-""")
-
-ffibuilder.set_source(
-    "nyxstone_tricore_gcc._native",
-    '#include "nyxstone_c.h"',
-    include_dirs    = INCLUDE_DIRS,
-    sources         = SOURCES,
-    extra_objects   = gas_objs,
-    libraries       = ["opcodes", "bfd", "iberty", "sframe",
-                       "z", "zstd", "dl", "m", "stdc++"],
-    library_dirs    = [str(EXTRACTED / "lib")],
-    extra_compile_args = ["-std=c++17"] if False else [],   # CFFI picks C++ via .cpp ext
-    extra_link_args = ["-Wl,--no-as-needed"],
+setup(
+    cffi_modules=["build_native.py:ffibuilder"],
+    cmdclass={"build_ext": nyx_build_ext},
 )
-
-if __name__ == "__main__":
-    ffibuilder.compile(verbose=True)
-    setup()

@@ -10,9 +10,10 @@ The public C++ API mirrors that of the sibling project
 [Nyxstone](https://github.com/emproof-com/nyxstone), a separate codebase
 built on LLVM-MC, covering the architectures LLVM supports.  This project
 is an independent implementation using GNU binutils to cover TriCore
-(which LLVM-MC has no backend for).  Both projects expose four methods
-named `assemble`, `assemble_to_instructions`, `disassemble`, and
-`disassemble_to_instructions`, with the same argument order and the same
+(which LLVM-MC has no backend for).  Both projects expose six methods --
+`assemble`, `assemble_to_instructions`, `assemble_with_relocs`,
+`assemble_to_instructions_with_relocs`, `disassemble`, and
+`disassemble_to_instructions` -- with the same argument order and the same
 `tl::expected<T, std::string>` error channel.  The Rust and Python
 bindings present the same shape one level up the stack.
 
@@ -41,57 +42,75 @@ never sees gas's types or macros, which keeps `nyxstone.cpp` pure C++17.
 ```
                                                        │
         ┌──────────────────────────────────────────────▼──────────┐
-        │  glue_reset()                                           │
+        │  glue_reset()  +  glue_begin_capture()                  │
         │    symbol_end + symbol_begin (wipe sy_hash)             │
         │    reset frag chains for .text/.data/.bss               │
         │    refresh frag_now / frchain_now / now_seg             │
-        └──────────────────────────────────────────────┬──────────┘
-                                                       │
-        ┌──────────────────────────────────────────────▼──────────┐
-        │  Inject `.equ name, value - address` for each external  │
-        │  LabelDefinition.  Encoding the value as (value-address)│
-        │  makes `j name` resolve correctly regardless of the     │
-        │  absolute `address` parameter; gas computes PC-relative │
-        │  displacement = (value-address) - branch_offset, which  │
-        │  equals (value - (address + branch_offset)).            │
+        │    swap `stderr` for a fopencookie stream so gas        │
+        │    diagnostics land in the error string, not the host   │
         └──────────────────────────────────────────────┬──────────┘
                                                        │
         ┌──────────────────────────────────────────────▼──────────┐
         │  Tokenize source                                        │
-        │    split on  '\n'  and  ';'                             │
+        │    split on  '\n'  and  ';'  (never inside "...")       │
         │    strip leading WS, # ... / // ... comments            │
+        │    (also quote-aware)                                   │
         │    repeatedly strip <ident>: label prefixes →           │
-        │       glue_colon(name)                                  │
+        │       glue_colon(name) / glue_fb_label(n) for digits    │
         └──────────────────────────────────────────────┬──────────┘
                                                        │
               .<dir> ?  yes ─────────────┐             │  no ───┐
                                          │                     │
         ┌────────────────────────────────▼─────┐  ┌────────────▼──────┐
         │ handle_directive(line)               │  │ glue_md_          │
-        │   data: .byte, .word, .org,          │  │   assemble(line)  │
-        │   .align, ...  →  emit bytes via     │  │   (gas's encoder) │
-        │   glue_emit_bytes / frag_more        │  └────────────┬──────┘
+        │   data: .byte, .word, ... → bytes    │  │   assemble(line)  │
+        │   via glue_emit_bytes, symbol refs   │  │   (gas's encoder) │
+        │   via glue_emit_cons (gas `cons`)    │  └────────────┬──────┘
+        │   .align/.p2align/.balign/.org →     │               │
+        │   real rs_align / rs_org frags       │               │
+        │   (sized post-relax, like gas)       │               │
+        │   .equ/.set → glue_set_sym (`equals`)│               │
         │   .text / .section .text*:  no-op    │               │
         │   .data / .bss / .section .foo /     │               │
         │   .pushsection:  set violation flag  │               │
+        │   unknown directive: error           │               │
         └────────────────────────────────┬─────┘               │
                                          │                     │
                                          └────────────┬────────┘
                                                       ▼
         ┌──────────────────────────────────────────────────────────┐
-        │  glue_resolve_text_fixups()                              │
-        │    layout()              : set fr_address cumulatively   │
-        │    finalize_relax_frags  : md_estimate_size_before_relax │
-        │                            + md_convert_frag             │
-        │    layout()              : fr_fix may have changed       │
-        │    apply each fix        : md_apply_fix per fixS         │
+        │  Plain path only: glue_define_abs(name, value) for each  │
+        │  LabelDefinition.  Runs AFTER parsing: at parse time the │
+        │  names look undefined, so gas emits the longest          │
+        │  (value-independent) branch forms; mutating the symbols  │
+        │  in place before the fixup pass makes references resolve │
+        │  (the fixups hold pointers to the parse-time symbolS).   │
         └──────────────────────────────────────────────┬───────────┘
                                                        │
         ┌──────────────────────────────────────────────▼───────────┐
+        │  glue_resolve_text_fixups(address)                       │
+        │    relax_branches      : seed subtypes (shortest for     │
+        │                          local targets, longest for      │
+        │                          external/absolute), then        │
+        │                          relax_segment passes            │
+        │    md_convert_frag     : final opcode bytes per branch   │
+        │                          (displacements stay as fixups)  │
+        │    finalize_align_org  : size rs_align/rs_org exactly,   │
+        │                          error on `.org` backwards       │
+        │    layout()            : final fr_address (fill-aware)   │
+        │    apply_text_fixups   : re-resolve symbols, encode      │
+        │                          displacements / absolute fields,│
+        │                          range-check (error if too far)  │
+        │    → unresolved count  : >0 in the plain path = error    │
+        │                          listing the undefined labels    │
+        └──────────────────────────────────────────────┬───────────┘
+                                                       │
+        ┌──────────────────────────────────────────────▼───────────┐
+        │  glue_end_capture()  →  diagnostics into error string    │
         │  glue_extract_text_bytes()                               │
         │    walk frchain → frag_root → fr_next                    │
         │    for in-progress tail frag use frag_now_fix()          │
-        │    return concatenated fr_literal bytes                  │
+        │    emit fr_literal bytes + align/org fill repetitions    │
         └──────────────────────────────────────────────────────────┘
 ```
 
@@ -130,12 +149,19 @@ with `-r`: a byte stream with reloc fields left as zero placeholders, plus
 a list of `RelocationInfo` records describing every unresolved external
 symbol reference.
 
+Note the asymmetry with the plain path: the "undefined label is an error"
+rule applies only to `assemble` / `assemble_to_instructions` (where nobody
+will ever patch the bytes again).  In the relocs path an undefined symbol
+is the expected case -- it is what becomes a relocation record for the
+linker -- so no `LabelDefinition` is required at all; a matching entry only
+fills the `symbol.address` hint field.
+
 How this differs from plain `assemble`:
 
 | stage | `assemble` | `assemble_with_relocs` |
 |---|---|---|
-| label injection | `.equ name, value - address` for every LabelDefinition | none, labels stay undefined |
-| md_apply_fix | resolves all fixes (fx_done=1) | undefined symbol fixes left at fx_done=0 |
+| label definition | `glue_define_abs(name, value)` after parsing for every LabelDefinition (absolute symbols) | none, labels stay undefined |
+| fixup pass | every fix resolves; leftover undefined symbols are an error | undefined symbol fixes left at fx_done=0 |
 | reloc collection | n/a | walks `text_section`'s `frchain.fix_root`, emits one entry per `fx_done==0 && fx_addsy` |
 
 For each unresolved fix the glue produces:
@@ -154,13 +180,20 @@ For each unresolved fix the glue produces:
 | `bfd_create` + `bfd_make_writable` | In-memory BFD; no file ever touched |
 | `subseg_new` / `subseg_set`        | Create / switch sections (always .text) |
 | `symbol_begin`/`symbol_end`/`colon`/`resolve_symbol_value` | Local label support |
+| `symbol_find`/`symbol_new`/`symbol_table_insert` | LabelDefinition → absolute symbols |
+| `fb_label_instance_inc`/`fb_label_name` | Numeric local labels (`1:` / `1b` / `1f`) |
+| `equals` (read.c)                  | `.equ`/`.set` with gas's full expression grammar |
+| `cons` (read.c)                    | `.word label` etc.: data lists with symbol refs |
 | `frag_init`/`subsegs_begin`/`frag_alloc`/`frag_more`/`frag_now_fix` | Frag chain |
+| `frag_align`/`frag_var(rs_org)`    | `.align`/`.org` as real frags, sized post-relax |
+| `relax_segment`                    | Generic relaxer (branch growth, align/org sizing) |
 | `read_begin`/`expr_begin`          | Expression evaluator (used by md_assemble) |
 | `md_begin` (TriCore)               | Build `hash_ops`/`hash_sfr`/`pseudo_codes` |
 | `md_assemble` (TriCore)            | **The encoder.** Bit-packs operands. |
 | `md_estimate_size_before_relax`    | Pick the size class for a relaxable frag |
 | `md_convert_frag`                  | Emit final bytes for a relaxable frag |
 | `md_apply_fix` / `md_pcrel_from_section` | Resolve PC-relative branches |
+| `as_bad` (via stderr capture)      | Diagnostics; captured into the error string |
 | `bfd_reloc_type_lookup` (libbfd) | Map `fx_r_type` → ELF `R_TRICORE_*` for `assemble_with_relocs` output |
 
 ## Section restriction (`.text`-only)

@@ -5,23 +5,28 @@
 //
 // Per-assemble flow:
 //   1. nyxstone_glue_reset()      , clear symbol table + frag chain.
-//   2. Inject `.equ name, value - address` for every LabelDefinition.
-//   3. Tokenize `source` on `\n` and `;`; per line strip whitespace and
-//      `#...` / `//...` comments.
-//   4. Repeatedly strip `<ident>:` label prefixes (calls nyxstone_glue_colon).
-//   5. Dispatch:
-//        - `.<dir>` → handle_directive (data directives, `.text`/`.section`
-//                      acceptance / section-violation flag).
+//   2. nyxstone_glue_begin_capture(), capture gas's stderr diagnostics.
+//   3. Plain path only: nyxstone_glue_define_abs(name, address) for every
+//      LabelDefinition (absolute symbols; resolved during fixups).
+//   4. Tokenize `source` on `\n` and `;` (never inside string literals);
+//      per line strip whitespace and `#...` / `//...` comments.
+//   5. Repeatedly strip `<ident>:` label prefixes (nyxstone_glue_colon;
+//      all-digit names go through nyxstone_glue_fb_label).
+//   6. Dispatch:
+//        - `.<dir>` → handle_directive (data directives, `.equ`/`.set`,
+//                      `.align`/`.org` frags, `.text`/`.section` acceptance
+//                      / section-violation flag; unknown directives error).
 //        - anything else → nyxstone_glue_md_assemble.
-//   6. nyxstone_glue_resolve_text_fixups(), relax + apply fixes.
-//   7. nyxstone_glue_extract_text_bytes() → return.
+//   7. nyxstone_glue_resolve_text_fixups(address), relax + apply fixes.
+//   8. Fail on captured gas errors / unresolved symbols, else
+//      nyxstone_glue_extract_text_bytes() → return.
 //
 // `address` is the absolute address of the first instruction.  PC-relative
 // branches within the source resolve to the same bytes regardless of
 // `address`; the parameter biases (a) the Instruction.address field on
-// `assemble_to_instructions` output and (b) every LabelDefinition value
-// (encoded as `.equ name, value - address` so external branches encode the
-// correct PC-relative displacement).
+// `assemble_to_instructions` output and (b) the displacement encoded for
+// references to LabelDefinition symbols (displacement = label - (address +
+// PC offset), computed in apply_text_fixups).
 
 #include "nyxstone/nyxstone.h"
 
@@ -40,10 +45,18 @@ extern "C" {
 int    nyxstone_glue_init_once (void);
 void   nyxstone_glue_reset (void);
 void   nyxstone_glue_colon (const char *name);
+void   nyxstone_glue_define_abs (const char *name, uint64_t value);
+void   nyxstone_glue_set_sym (const char *name, const char *value_expr);
+void   nyxstone_glue_fb_label (unsigned int n);
 void   nyxstone_glue_md_assemble (char *line);
 void   nyxstone_glue_emit_bytes (const uint8_t *p, size_t n);
-size_t nyxstone_glue_frag_now_fix (void);
-int    nyxstone_glue_resolve_text_fixups (void);
+void   nyxstone_glue_emit_cons (const char *args, int nbytes);
+void   nyxstone_glue_align (unsigned int p2, int fill, unsigned int max);
+void   nyxstone_glue_org (uint64_t target, int fill);
+void   nyxstone_glue_error (const char *msg);
+void   nyxstone_glue_begin_capture (void);
+const char *nyxstone_glue_end_capture (void);
+int    nyxstone_glue_resolve_text_fixups (uint64_t base);
 const char *nyxstone_glue_unsupported_reloc (void);
 size_t nyxstone_glue_extract_text_bytes (uint8_t *out, size_t cap);
 int    nyxstone_glue_had_errors (void);
@@ -70,6 +83,14 @@ namespace {
 // Per-call section-violation flag, cleared at the top of every assemble().
 bool g_section_violation = false;
 
+// Per-call directive error (unknown directive, malformed operand, ...).
+// First error wins; checked by do_assemble after the source is processed.
+std::string g_directive_error;
+
+void directive_error(std::string msg) {
+    if (g_directive_error.empty()) g_directive_error = std::move(msg);
+}
+
 // ---- string helpers ------------------------------------------------------
 inline void ltrim(std::string& s) {
     size_t i = 0;
@@ -82,12 +103,42 @@ inline void rtrim(std::string& s) {
     s.resize(i);
 }
 inline void strip_comment(std::string& s) {
-    // Strip `# ...` or `// ...` to end of line.  `;` already split before
-    // we get here.
-    size_t h = s.find('#');
-    size_t l = s.find("//");
-    size_t cut = std::min(h, l);
-    if (cut != std::string::npos) s.resize(cut);
+    // Strip `# ...` (gas's TriCore comment char) or `// ...` to end of line,
+    // but never inside a "..." string literal -- `.asciz "a#b"` keeps its
+    // hash.  `;` statement separators were already split off before we get
+    // here (equally quote-aware, see split_statements).
+    bool in_str = false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (in_str) {
+            if (c == '\\' && i + 1 < s.size()) ++i;       // skip escaped char
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') { in_str = true; continue; }
+        if (c == '#' || (c == '/' && i + 1 < s.size() && s[i+1] == '/')) {
+            s.resize(i);
+            return;
+        }
+    }
+}
+
+// Turn gas's captured stderr text into a single-line diagnostic: drop the
+// "Assembler messages:" banner, strip per-line "Error: "/"Warning: "
+// prefixes' surrounding noise, and join the remaining lines with "; ".
+std::string clean_gas_diag(const char* captured) {
+    std::string out;
+    if (!captured) return out;
+    std::istringstream in(captured);
+    std::string line;
+    while (std::getline(in, line)) {
+        rtrim(line); ltrim(line);
+        if (line.empty()) continue;
+        if (line == "Assembler messages:") continue;
+        if (!out.empty()) out += "; ";
+        out += line;
+    }
+    return out;
 }
 
 bool parse_int(const char* p, const char* end, int64_t& out, const char*& cur) {
@@ -127,12 +178,63 @@ void emit_int_list(const std::string& args, int width) {
     }
 }
 
-void emit_ascii(const std::string& args, bool zero_term) {
+// True if `args` is a (possibly empty) comma-separated list of plain integer
+// literals — i.e. the fast emit_int_list path is sufficient.  A symbol or
+// expression (e.g. `label`, `end-start`, `4+x`) makes this false, in which case
+// the directive is forwarded to gas's `cons` so it can emit bytes + fixups.
+bool all_int_literals(const std::string& args) {
     const char* p = args.c_str();
     const char* end = p + args.size();
     while (p < end) {
         while (p < end && std::isspace(static_cast<unsigned char>(*p))) ++p;
-        if (p >= end || *p != '"') break;
+        if (p >= end) break;
+        int64_t v; const char* next = nullptr;
+        if (!parse_int(p, end, v, next)) return false;
+        p = next;
+        while (p < end && std::isspace(static_cast<unsigned char>(*p))) ++p;
+        if (p >= end) break;
+        if (*p != ',') return false;   // trailing token after a literal (expr)
+        ++p;
+    }
+    return true;
+}
+
+// Parse up to `max_args` comma-separated integer literals from `args` into
+// `out`.  Returns the number parsed, or -1 if the text is malformed (extra
+// tokens, non-literal operand).  Missing trailing operands keep their
+// caller-provided defaults.
+int parse_int_args(const std::string& args, int64_t* out, int max_args) {
+    const char* p = args.c_str();
+    const char* end = p + args.size();
+    int n = 0;
+    while (n < max_args) {
+        while (p < end && std::isspace(static_cast<unsigned char>(*p))) ++p;
+        if (p >= end) return n;
+        const char* next = nullptr;
+        if (!parse_int(p, end, out[n], next)) return -1;
+        ++n;
+        p = next;
+        while (p < end && std::isspace(static_cast<unsigned char>(*p))) ++p;
+        if (p >= end) return n;
+        if (*p != ',') return -1;
+        ++p;
+    }
+    while (p < end && std::isspace(static_cast<unsigned char>(*p))) ++p;
+    return (p >= end) ? n : -1;
+}
+
+void emit_ascii(const std::string& d, const std::string& args, bool zero_term) {
+    const char* p = args.c_str();
+    const char* end = p + args.size();
+    bool any = false;
+    while (p < end) {
+        while (p < end && std::isspace(static_cast<unsigned char>(*p))) ++p;
+        if (p >= end) break;
+        if (*p != '"') {
+            directive_error(d + ": expected a quoted string, got '" + args + "'");
+            return;
+        }
+        any = true;
         ++p;
         std::string out;
         while (p < end && *p != '"') {
@@ -152,12 +254,17 @@ void emit_ascii(const std::string& args, bool zero_term) {
                 out += *p++;
             }
         }
-        if (p < end && *p == '"') ++p;
+        if (p >= end) {
+            directive_error(d + ": unterminated string");
+            return;
+        }
+        ++p;  // closing quote
         nyxstone_glue_emit_bytes(reinterpret_cast<const uint8_t*>(out.data()), out.size());
         if (zero_term) emit_u8(0);
         while (p < end && std::isspace(static_cast<unsigned char>(*p))) ++p;
         if (p < end && *p == ',') ++p;
     }
+    if (!any) directive_error(d + ": expected a quoted string");
 }
 
 // Returns true if `line` was a recognized directive (handled or rejected).
@@ -168,45 +275,88 @@ bool handle_directive(const std::string& line) {
     std::string args = (i < line.size()) ? line.substr(i + 1) : "";
     ltrim(args); rtrim(args);
 
-    if (d == ".byte")                                                       { emit_int_list(args, 1); return true; }
-    if (d == ".half" || d == ".short" || d == ".2byte")                     { emit_int_list(args, 2); return true; }
-    if (d == ".word" || d == ".int" || d == ".long" || d == ".4byte")       { emit_int_list(args, 4); return true; }
-    if (d == ".quad" || d == ".8byte")                                      { emit_int_list(args, 8); return true; }
-    if (d == ".ascii")                                                      { emit_ascii(args, false); return true; }
-    if (d == ".asciz" || d == ".string")                                    { emit_ascii(args, true);  return true; }
+    // Data lists: pure-literal lists take the fast in-house path; lists that
+    // contain a symbol or expression are forwarded to gas's `cons`, which emits
+    // the bytes and creates fixups (resolved locally / recorded as relocs).
+    {
+        int w = 0;
+        if (d == ".byte")                                                       w = 1;
+        else if (d == ".half" || d == ".hword" || d == ".short" || d == ".2byte") w = 2;
+        else if (d == ".word" || d == ".int" || d == ".long" || d == ".4byte")  w = 4;
+        else if (d == ".quad" || d == ".8byte")                                 w = 8;
+        if (w) {
+            if (all_int_literals(args)) emit_int_list(args, w);
+            else                        nyxstone_glue_emit_cons(args.c_str(), w);
+            return true;
+        }
+    }
+    if (d == ".ascii")                                                      { emit_ascii(d, args, false); return true; }
+    if (d == ".asciz" || d == ".string")                                    { emit_ascii(d, args, true);  return true; }
     if (d == ".skip" || d == ".space" || d == ".zero") {
-        int64_t n = 0; const char* next;
-        if (parse_int(args.c_str(), args.c_str() + args.size(), n, next) && n > 0) {
-            std::vector<uint8_t> zeros(static_cast<size_t>(n), 0);
-            nyxstone_glue_emit_bytes(zeros.data(), zeros.size());
+        // .skip/.space size[, fill]   .zero size   (fill defaults to 0)
+        int64_t vals[2] = {0, 0};
+        int n_args = parse_int_args(args, vals, (d == ".zero") ? 1 : 2);
+        if (n_args < 1) { directive_error(d + ": expected a size operand, got '" + args + "'"); return true; }
+        if (vals[0] < 0) { directive_error(d + ": negative size"); return true; }
+        if (vals[0] > 0) {
+            std::vector<uint8_t> fill(static_cast<size_t>(vals[0]),
+                                      static_cast<uint8_t>(vals[1]));
+            nyxstone_glue_emit_bytes(fill.data(), fill.size());
         }
         return true;
     }
     if (d == ".org") {
-        int64_t target = 0; const char* next;
-        if (parse_int(args.c_str(), args.c_str() + args.size(), target, next)) {
-            int64_t cur = static_cast<int64_t>(nyxstone_glue_frag_now_fix());
-            if (target > cur) {
-                std::vector<uint8_t> zeros(static_cast<size_t>(target - cur), 0);
-                nyxstone_glue_emit_bytes(zeros.data(), zeros.size());
-            }
-        }
+        // .org target[, fill]: emitted as a real rs_org frag so the padding
+        // is sized after branch relaxation; moving backwards is a gas error.
+        int64_t vals[2] = {0, 0};
+        int n_args = parse_int_args(args, vals, 2);
+        if (n_args < 1) { directive_error(d + ": expected an offset operand, got '" + args + "'"); return true; }
+        if (vals[0] < 0) { directive_error(d + ": negative offset"); return true; }
+        nyxstone_glue_org(static_cast<uint64_t>(vals[0]), static_cast<int>(vals[1]));
         return true;
     }
-    if (d == ".align" || d == ".balign") {
-        int64_t n = 0; const char* next;
-        if (!parse_int(args.c_str(), args.c_str() + args.size(), n, next)) return true;
-        size_t boundary;
-        if (d == ".align") {
-            if (n < 0 || n > 30) return true;
-            boundary = size_t(1) << n;
+    if (d == ".align" || d == ".p2align" || d == ".balign") {
+        // .align/.p2align p2[, fill[, max]] (power-of-two exponent, the gas
+        // s_align_ptwo semantics this TriCore port uses);
+        // .balign bytes[, fill[, max]] (byte boundary, must be a power of 2).
+        // Emitted as a real rs_align frag so padding is sized post-relax.
+        int64_t vals[3] = {0, 0, 0};
+        int n_args = parse_int_args(args, vals, 3);
+        if (n_args < 1) { directive_error(d + ": expected an alignment operand, got '" + args + "'"); return true; }
+        unsigned p2;
+        if (d == ".balign") {
+            int64_t b = vals[0];
+            if (b <= 0 || (b & (b - 1)) != 0) {
+                directive_error(d + ": alignment is not a power of 2");
+                return true;
+            }
+            p2 = 0;
+            while ((int64_t(1) << p2) < b) ++p2;
         } else {
-            if (n <= 0) return true;
-            boundary = static_cast<size_t>(n);
+            if (vals[0] < 0 || vals[0] > 30) {
+                directive_error(d + ": alignment exponent out of range (0..30)");
+                return true;
+            }
+            p2 = static_cast<unsigned>(vals[0]);
         }
-        size_t cur = nyxstone_glue_frag_now_fix();
-        size_t pad = (boundary - (cur % boundary)) % boundary;
-        if (pad) { std::vector<uint8_t> zeros(pad, 0); nyxstone_glue_emit_bytes(zeros.data(), pad); }
+        nyxstone_glue_align(p2, static_cast<int>(vals[1]),
+                            (n_args >= 3 && vals[2] > 0)
+                                ? static_cast<unsigned>(vals[2]) : 0u);
+        return true;
+    }
+    if (d == ".equ" || d == ".set") {
+        // .equ name, expr -- gas's `equals` handles the expression grammar
+        // (constants, label arithmetic, forward references).
+        size_t comma = args.find(',');
+        std::string name = args.substr(0, comma == std::string::npos ? args.size() : comma);
+        rtrim(name);
+        std::string expr = (comma == std::string::npos) ? "" : args.substr(comma + 1);
+        ltrim(expr); rtrim(expr);
+        if (name.empty() || expr.empty()) {
+            directive_error(d + ": expected 'name, expression', got '" + args + "'");
+            return true;
+        }
+        nyxstone_glue_set_sym(name.c_str(), expr.c_str());
         return true;
     }
 
@@ -236,8 +386,8 @@ bool handle_directive(const std::string& line) {
     // the .text byte stream.
     if (d == ".global" || d == ".globl" || d == ".local" || d == ".weak"
         || d == ".type" || d == ".size" || d == ".file" || d == ".ident"
-        || d == ".syntax" || d == ".cpu" || d == ".arch" || d == ".equ"
-        || d == ".set" || d == ".extern" || d == ".end") {
+        || d == ".syntax" || d == ".cpu" || d == ".arch"
+        || d == ".extern" || d == ".end") {
         return true;
     }
     return false;
@@ -246,13 +396,14 @@ bool handle_directive(const std::string& line) {
 // ---- core assemble ------------------------------------------------------
 //
 // Two operating modes:
-//   - `with_relocs == false` (default): inject `.equ name, value - address`
-//     for every LabelDefinition.  External labels become absolute symbols;
-//     md_apply_fix resolves them; no relocations are emitted.
+//   - `with_relocs == false` (default): define every LabelDefinition as an
+//     absolute symbol (nyxstone_glue_define_abs).  References resolve in
+//     apply_text_fixups; an unresolved symbol (no definition anywhere) is
+//     an error.  No relocations are emitted.
 //
-//   - `with_relocs == true` (the `_with_relocs` API path): do NOT inject
-//     anything for LabelDefinitions.  References to them stay as undefined
-//     symbols; md_apply_fix sees fx_addsy == undefined, leaves fx_done == 0,
+//   - `with_relocs == true` (the `_with_relocs` API path): do NOT define
+//     LabelDefinitions.  References to them stay as undefined symbols;
+//     md_apply_fix sees fx_addsy == undefined, leaves fx_done == 0,
 //     and records the addend in fx_addnumber (see tc-tricore.c).  We then
 //     walk the fix chain and turn each unresolved entry into a
 //     RelocationInfo, equivalent to what `gas -r` would write into an ELF
@@ -272,20 +423,13 @@ tl::expected<AssembleCore, std::string> do_assemble(
 {
     nyxstone_glue_reset();
     g_section_violation = false;
+    g_directive_error.clear();
     const int errs_before = nyxstone_glue_had_errors();
 
-    // In the "no relocs" path: prepend `.equ name, value - address` for
-    // every external label so gas resolves them inline.
-    std::string injected;
-    if (!with_relocs) {
-        for (const auto& l : labels) {
-            const uint64_t rel = l.address - address;
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), ".equ %s, 0x%llx\n",
-                          l.name.c_str(), static_cast<unsigned long long>(rel));
-            injected.append(buf);
-        }
-    }
+    // Capture gas's stderr for the whole parse + fixup window: as_bad/as_warn
+    // text becomes part of our error strings instead of polluting the host
+    // process's stderr.
+    nyxstone_glue_begin_capture();
 
     auto process = [](std::string line) {
         ltrim(line);
@@ -294,21 +438,34 @@ tl::expected<AssembleCore, std::string> do_assemble(
         if (line.empty()) return;
 
         // Strip ALL leading `<ident>:` prefixes (gas allows `a: b: nop`).
+        // All-digit names are gas "fb" numeric local labels (`1:`,
+        // referenced as `1b`/`1f`) and need the dedicated instance counter.
         while (true) {
             size_t cp = 0;
+            bool all_digits = true;
             while (cp < line.size() && (std::isalnum(static_cast<unsigned char>(line[cp]))
                                         || line[cp] == '_' || line[cp] == '.'
-                                        || line[cp] == '$')) ++cp;
+                                        || line[cp] == '$')) {
+                if (!std::isdigit(static_cast<unsigned char>(line[cp]))) all_digits = false;
+                ++cp;
+            }
             if (cp == 0 || cp >= line.size() || line[cp] != ':') break;
             std::string name = line.substr(0, cp);
-            nyxstone_glue_colon(name.c_str());
+            if (all_digits)
+                nyxstone_glue_fb_label(static_cast<unsigned int>(std::strtoul(name.c_str(), nullptr, 10)));
+            else
+                nyxstone_glue_colon(name.c_str());
             line.erase(0, cp + 1);
             ltrim(line);
             if (line.empty()) return;
         }
 
         if (line[0] == '.') {
-            (void) handle_directive(line);
+            if (!handle_directive(line)) {
+                size_t sp = 0;
+                while (sp < line.size() && !std::isspace(static_cast<unsigned char>(line[sp]))) ++sp;
+                directive_error("unsupported directive '" + line.substr(0, sp) + "'");
+            }
         } else {
             std::vector<char> mut(line.begin(), line.end());
             mut.push_back('\0');
@@ -316,30 +473,87 @@ tl::expected<AssembleCore, std::string> do_assemble(
         }
     };
 
+    // Split on '\n' and ';' (gas's TriCore line separator), but never inside
+    // a "..." string literal: `.ascii "a;b"` is one statement.
     auto run = [&](const std::string& text) {
         std::string cur;
-        for (char c : text) {
+        bool in_str = false;
+        for (size_t i = 0; i < text.size(); ++i) {
+            char c = text[i];
+            if (in_str) {
+                cur.push_back(c);
+                if (c == '\\' && i + 1 < text.size()) cur.push_back(text[++i]);
+                else if (c == '"') in_str = false;
+                continue;
+            }
+            if (c == '"') { in_str = true; cur.push_back(c); continue; }
             if (c == '\n' || c == ';') { process(std::move(cur)); cur.clear(); }
             else cur.push_back(c);
         }
         if (!cur.empty()) process(std::move(cur));
     };
 
-    run(injected);
     run(source);
 
-    if (nyxstone_glue_had_errors() != errs_before)
-        return tl::make_unexpected("assemble: gas parse/encode error");
+    // Plain path: define every LabelDefinition as an absolute symbol holding
+    // its full address, so the fixup pass resolves references to it.  This
+    // happens AFTER parsing on purpose: at parse time the names look
+    // undefined, so gas emits the longest (value-independent) branch forms
+    // and the produced bytes are invariant under the `address` parameter.
+    // In the relocs path the labels stay undefined so each reference is
+    // reported as a relocation instead.
+    if (!with_relocs)
+        for (const auto& l : labels)
+            nyxstone_glue_define_abs(l.name.c_str(), l.address);
+
+    const bool parse_err = nyxstone_glue_had_errors() != errs_before;
+    int unresolved = 0;
+    if (!parse_err && !g_section_violation && g_directive_error.empty())
+        unresolved = nyxstone_glue_resolve_text_fixups(address);
+
+    const std::string diag = clean_gas_diag(nyxstone_glue_end_capture());
+
+    if (!g_directive_error.empty())
+        return tl::make_unexpected("assemble: " + g_directive_error);
     if (g_section_violation)
         return tl::make_unexpected(
             "assemble: directive switches active section (only .text is allowed)");
-
-    nyxstone_glue_resolve_text_fixups();
+    if (parse_err)
+        return tl::make_unexpected(
+            "assemble: " + (diag.empty() ? std::string("gas parse/encode error") : diag));
 
     if (const char* bad = nyxstone_glue_unsupported_reloc())
         return tl::make_unexpected(
             std::string("assemble: unsupported relocation ") + bad
             + " (local branch displacement could not be encoded)");
+
+    // Errors raised during relax / md_convert_frag / fixup (e.g. branch
+    // displacement out of range, `.org` moving backwards) happen after the
+    // parse-time check above, so re-check the error counter and fail loudly
+    // rather than return bytes.
+    if (nyxstone_glue_had_errors() != errs_before)
+        return tl::make_unexpected(
+            "assemble: " + (diag.empty() ? std::string("gas error during relax/fixup") : diag));
+
+    // Plain path: every symbol must have resolved -- a leftover unresolved
+    // fixup means a reference to a label that is neither defined in the
+    // source nor supplied via LabelDefinition.  Emitting 0 silently (gas's
+    // object-file behaviour) is wrong for a raw byte stream, so fail with
+    // the offending names.
+    if (!with_relocs && unresolved > 0) {
+        size_t count = nyxstone_glue_collect_relocs(nullptr, 0);
+        std::vector<nyxstone_glue_reloc_t> raw(count);
+        if (count) nyxstone_glue_collect_relocs(raw.data(), raw.size());
+        std::string names;
+        for (const auto& r : raw) {
+            if (!r.symbol_name) continue;
+            if (!names.empty()) names += ", ";
+            names += r.symbol_name;
+        }
+        return tl::make_unexpected(
+            "assemble: undefined label(s): " + (names.empty() ? std::string("<unknown>") : names)
+            + " (define them in the source or pass a LabelDefinition)");
+    }
 
     AssembleCore result;
     size_t n = nyxstone_glue_extract_text_bytes(nullptr, 0);

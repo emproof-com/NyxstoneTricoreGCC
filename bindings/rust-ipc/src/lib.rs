@@ -6,7 +6,7 @@
 //!
 //! ```toml
 //! # max performance, GPL-3.0+:
-//! nyxstone-tricore-gcc     = "0.2"
+//! nyxstone-tricore-gcc     = "0.1"
 //!
 //! # commercially permissive, ~150 k ops/s via IPC:
 //! nyxstone-tricore-gcc-ipc = "0.1"
@@ -16,20 +16,35 @@
 //!
 //! # How the IPC mode works
 //!
-//! On first `NyxstoneTricoreGCC::new()` call the crate fork+execs the
+//! Every `NyxstoneTricoreGCC::new()` call fork+execs its own
 //! `nyxstone-tcd` daemon binary (GPL-3.0+, distributed separately, install
 //! via `cargo install nyxstone-tricore-gcc`), then talks to it over a
 //! `socketpair(2)` UNIX socket using a small custom binary protocol.
 //!
 //! The daemon:
-//! - is **one per parent process**.  Different parents never share daemons.
-//! - is **lazy**, spawned on the first `new()`, not at module init.
-//! - has its **lifetime tied to the parent process** via `PR_SET_PDEATHSIG`
-//!   on Linux: kernel sends `SIGTERM` to the daemon the moment the parent
-//!   exits (including crashes and `kill -9`).
+//! - is **one per `NyxstoneTricoreGCC` instance**, owned by that instance.
+//!   Instances (and processes) never share daemons.
+//! - is **lazy**, spawned on `new()`, not at module init.
+//! - has its **lifetime tied to its socket**: when the instance is dropped,
+//!   or the parent process dies for any reason (crash, `kill -9`, normal
+//!   exit), the OS closes the socket and the daemon exits on read-EOF.
+//!   `PR_SET_PDEATHSIG` is deliberately *not* used — it is parent-*thread*-
+//!   scoped on Linux and would kill a daemon whose spawning thread exited
+//!   while the instance lives on (see `daemon.rs`).
 //! - serves **strict FIFO** request/response, no out-of-order completion,
 //!   no request IDs.  Multi-threaded callers serialize through a
 //!   per-instance `Mutex`.
+//!
+//! # Timeouts and automatic respawn
+//!
+//! Every request is bounded by a socket read+write timeout, 30 s by default,
+//! overridable via the `NYXSTONE_TCD_TIMEOUT_MS` env var (read once when the
+//! instance is created; `0` disables the timeout).  After any transport
+//! error — timeout, daemon crash/EOF, connection reset — the stream may be
+//! desynced and is never reused: the daemon is torn down and respawned once
+//! (with a fresh handshake) and the request is retried exactly once.  If the
+//! retry also fails, the error is returned.  Daemon-level error replies
+//! (gas diagnostics etc.) are valid responses and are never retried.
 //!
 //! # Locating the daemon
 //!
@@ -226,6 +241,10 @@ impl NyxstoneTricoreGCC {
 
     /// `gas -r` style: returns bytes (with reloc placeholders zeroed) plus
     /// one [`RelocationInfo`] per external label reference.
+    ///
+    /// Unlike the plain paths, an undefined symbol is NOT an error here --
+    /// this is the link-later path.  `labels` may be empty; a matching
+    /// entry only fills the `symbol.address` hint field.
     pub fn assemble_with_relocs(&self, source: &str, address: Address,
                                 labels: &[LabelDefinition])
         -> Result<(Vec<u8>, Vec<RelocationInfo>), Error>
@@ -234,7 +253,9 @@ impl NyxstoneTricoreGCC {
     }
 
     /// Same as [`assemble_to_instructions`] but with `-r`-style relocation
-    /// output.
+    /// output (see [`assemble_with_relocs`](Self::assemble_with_relocs) for
+    /// the undefined-symbol semantics).  Relocation sites decode with
+    /// displacement 0, like objdump on an unlinked object.
     pub fn assemble_to_instructions_with_relocs(
         &self, source: &str, address: Address, labels: &[LabelDefinition],
     ) -> Result<(Vec<Instruction>, Vec<RelocationInfo>), Error>
@@ -255,6 +276,12 @@ impl NyxstoneTricoreGCC {
         -> Result<Vec<Instruction>, Error>
     {
         self.conn.disassemble_to_instructions(bytes, address, count)
+    }
+
+    /// Test hook: pid of the daemon currently backing this instance.
+    #[cfg(test)]
+    fn daemon_pid_for_tests(&self) -> u32 {
+        self.conn.daemon_pid()
     }
 }
 
@@ -326,6 +353,24 @@ mod tests {
         let ext = nx.assemble("nop\n nop\n j ext\n", 0, &labels).unwrap();
         assert_eq!(ext.len(), 8); // nop nop (4) + long j (4)
         assert_eq!(ext[4], 0x1d);
+    }
+
+    #[test]
+    fn data_symbol_references() {
+        let nx = NyxstoneTricoreGCC::new().unwrap();
+        // `.word` to a local label encodes its absolute address (base+offset),
+        // instead of being silently dropped.  nop(2)+.word(4)+ret(2); here@+6.
+        let b = nx.assemble("start:\n nop\n .word here\nhere:\n ret\n", 0x1000, &[]).unwrap();
+        assert_eq!(&b[2..6], &[0x06, 0x10, 0x00, 0x00]);
+        // A label difference folds to a constant (b - a == 4 bytes).
+        let b = nx.assemble("a:\n nop\n nop\nb:\n .word b - a\n", 0x1000, &[]).unwrap();
+        assert_eq!(&b[4..8], &[0x04, 0x00, 0x00, 0x00]);
+        // Pure-literal data lists still take the fast path unchanged.
+        assert_eq!(nx.assemble(".word 0x11223344\n", 0, &[]).unwrap(),
+                   vec![0x44, 0x33, 0x22, 0x11]);
+        // `.short`/`.byte` to a local label take the low bits of the address.
+        let b = nx.assemble("l:\n nop\n .short l\n", 0x1000, &[]).unwrap();
+        assert_eq!(&b[2..4], &[0x00, 0x10]);
     }
 
     #[test]
@@ -430,5 +475,49 @@ mod tests {
         assert_eq!(insns[1].address, 0x1002);
         assert_eq!(relocs.len(), 1);
         assert_eq!(relocs[0].offset, 0x2);
+    }
+
+    #[test]
+    fn label_with_interior_nul_is_error_not_panic() {
+        let nx = NyxstoneTricoreGCC::new().unwrap();
+        // Must surface as Err end-to-end; in particular it must not panic
+        // (or kill) the daemon, which keeps serving afterwards.
+        let labels = [LabelDefinition::new("bad\0name", 0x1000)];
+        let err = nx.assemble("j ext\n", 0, &labels).unwrap_err();
+        assert!(matches!(err, Error::AssembleFailed(_)), "{err:?}");
+        assert_eq!(nx.assemble("nop", 0, &[]).unwrap(), vec![0x00, 0x00]);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn oversized_disassemble_count_is_error() {
+        let nx = NyxstoneTricoreGCC::new().unwrap();
+        let bytes = nx.assemble("nop; ret", 0, &[]).unwrap();
+        // count == 2^32 used to truncate to 0, inverting the semantics
+        // (0 = "decode all").  It must be a hard error instead.
+        let err = nx.disassemble(&bytes, 0, 1usize << 32).unwrap_err();
+        assert!(matches!(err, Error::DisassembleFailed(_)), "{err:?}");
+        // The largest representable count still works.
+        assert!(nx.disassemble(&bytes, 0, u32::MAX as usize).is_ok());
+    }
+
+    #[test]
+    fn daemon_killed_then_next_call_succeeds_via_respawn() {
+        let nx = NyxstoneTricoreGCC::new().unwrap();
+        assert_eq!(nx.assemble("nop", 0, &[]).unwrap(), vec![0x00, 0x00]);
+
+        // Hard-kill the daemon out from under the instance.
+        let old_pid = nx.daemon_pid_for_tests();
+        unsafe { libc::kill(old_pid as libc::pid_t, libc::SIGKILL); }
+        // Give the kernel a moment to tear the process down and close its
+        // socket end so the next call observes the transport error.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // The next call hits a transport error, respawns the daemon once,
+        // and retries the request transparently.
+        assert_eq!(nx.assemble("nop", 0, &[]).unwrap(), vec![0x00, 0x00]);
+        assert_ne!(nx.daemon_pid_for_tests(), old_pid);
+        // The fresh connection keeps working.
+        assert_eq!(nx.assemble("ret", 0, &[]).unwrap().len(), 2);
     }
 }

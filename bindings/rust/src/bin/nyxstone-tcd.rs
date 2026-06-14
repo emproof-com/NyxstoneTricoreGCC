@@ -10,6 +10,9 @@
 //!   - Initializes the in-process gas instance (one-time per process).
 //!   - Writes the handshake bytes the client validates.
 //!   - Loops: read request frame → dispatch → write response frame.
+//!     Malformed request bodies (unknown opcode, invalid UTF-8) get an
+//!     ERR_PROTOCOL reply and the daemon keeps serving; only frame-level
+//!     stream errors (which desync the socket) are fatal.
 //!   - Exits cleanly when the client closes its socket end (read EOF), which
 //!     also covers the parent process dying (the OS closes the fd).  We do not
 //!     use PR_SET_PDEATHSIG: it is parent-thread-scoped on Linux and would kill
@@ -66,71 +69,91 @@ fn serve(mut r: impl Read, mut w: impl Write, nyx: &NyxstoneTricoreGCC)
     p::write_handshake(&mut w)?;
     w.flush()?;
     loop {
-        // Read one request.  EOF = client closed socket → graceful exit.
-        let req = match p::Request::read(&mut r) {
-            Ok(req) => req,
+        // Read one raw frame.  EOF = client closed socket → graceful exit.
+        // Other frame-level errors (short read, oversized body_len) leave the
+        // stream desynced, so they remain fatal.
+        let (header, raw_body) = match p::read_frame(&mut r) {
+            Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
-        let (status, flags, body) = dispatch(nyx, &req);
+        // The frame is fully consumed at this point, so a request-body parse
+        // error (unknown opcode, invalid UTF-8, truncated body) must NOT kill
+        // the daemon: reply ERR_PROTOCOL and keep serving.
+        let (status, flags, body) = match p::parse_request(header.kind, &raw_body) {
+            Ok(req) => dispatch(nyx, &req),
+            Err(e)  => protocol_err_response(&format!("bad request: {e}")),
+        };
+        // Never emit a frame the client would reject (or that would truncate
+        // the u32 length prefix); downgrade to an in-band protocol error.
+        let (status, flags, body) = match u32::try_from(body.len()) {
+            Ok(n) if n <= p::MAX_FRAME => (status, flags, body),
+            _ => protocol_err_response(&format!(
+                "response body of {} bytes exceeds MAX_FRAME ({} bytes)",
+                body.len(), p::MAX_FRAME)),
+        };
         write_response_header(&mut w, status, flags, body.len() as u32)?;
         w.write_all(&body)?;
         w.flush()?;
     }
 }
 
+fn protocol_err_response(msg: &str) -> (u8, u8, Vec<u8>) {
+    let mut body = Vec::with_capacity(msg.len() + 4);
+    p::write_err_body(&mut body, msg);
+    (status::ERR_PROTOCOL, 0, body)
+}
+
 fn dispatch(nyx: &NyxstoneTricoreGCC, req: &p::Request) -> (u8, u8, Vec<u8>) {
     match req {
         p::Request::Assemble { src, address, labels, with_relocs: false, want_instructions: false } => {
             match nyx.assemble(src, *address, &to_gpl_labels(labels)) {
-                Ok(bytes) => {
+                Ok(bytes) => ok_or_protocol(0, {
                     let mut body = Vec::with_capacity(bytes.len() + 8);
-                    let _ = p::write_bytes(&mut body, &bytes);
-                    (status::OK, 0, body)
-                }
+                    p::write_bytes(&mut body, &bytes).map(|_| body)
+                }),
                 Err(e) => err_response(e),
             }
         }
         p::Request::Assemble { src, address, labels, with_relocs: false, want_instructions: true } => {
             match nyx.assemble_to_instructions(src, *address, &to_gpl_labels(labels)) {
-                Ok(insns) => (status::OK, 0, encode_instructions(&insns)),
+                Ok(insns) => ok_or_protocol(0, encode_instructions(&insns)),
                 Err(e)    => err_response(e),
             }
         }
         p::Request::Assemble { src, address, labels, with_relocs: true, want_instructions: false } => {
             match nyx.assemble_with_relocs(src, *address, &to_gpl_labels(labels)) {
-                Ok((bytes, relocs)) => {
+                Ok((bytes, relocs)) => ok_or_protocol(1, (|| {
                     let mut body = Vec::with_capacity(bytes.len() + relocs.len() * 64 + 16);
-                    let _ = p::write_bytes(&mut body, &bytes);
-                    encode_relocs(&mut body, &relocs);
-                    (status::OK, 1, body)
-                }
+                    p::write_bytes(&mut body, &bytes)?;
+                    encode_relocs(&mut body, &relocs)?;
+                    Ok(body)
+                })()),
                 Err(e) => err_response(e),
             }
         }
         p::Request::Assemble { src, address, labels, with_relocs: true, want_instructions: true } => {
             match nyx.assemble_to_instructions_with_relocs(src, *address, &to_gpl_labels(labels)) {
-                Ok((insns, relocs)) => {
-                    let mut body = encode_instructions(&insns);
-                    encode_relocs(&mut body, &relocs);
-                    (status::OK, 1, body)
-                }
+                Ok((insns, relocs)) => ok_or_protocol(1, (|| {
+                    let mut body = encode_instructions(&insns)?;
+                    encode_relocs(&mut body, &relocs)?;
+                    Ok(body)
+                })()),
                 Err(e) => err_response(e),
             }
         }
         p::Request::Disassemble { bytes, address, count, want_instructions: false } => {
             match nyx.disassemble(bytes, *address, *count as usize) {
-                Ok(s) => {
+                Ok(s) => ok_or_protocol(0, {
                     let mut body = Vec::with_capacity(s.len() + 4);
-                    let _ = p::write_bytes(&mut body, s.as_bytes());
-                    (status::OK, 0, body)
-                }
+                    p::write_bytes(&mut body, s.as_bytes()).map(|_| body)
+                }),
                 Err(e) => err_response(e),
             }
         }
         p::Request::Disassemble { bytes, address, count, want_instructions: true } => {
             match nyx.disassemble_to_instructions(bytes, *address, *count as usize) {
-                Ok(insns) => (status::OK, 0, encode_instructions(&insns)),
+                Ok(insns) => ok_or_protocol(0, encode_instructions(&insns)),
                 Err(e)    => err_response(e),
             }
         }
@@ -141,21 +164,36 @@ fn to_gpl_labels(ls: &[p::LabelDef]) -> Vec<LabelDefinition> {
     ls.iter().map(|l| LabelDefinition::new(l.name.clone(), l.address)).collect()
 }
 
-fn encode_instructions(insns: &[nyxstone_tricore_gcc::Instruction]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(insns.len() * 32 + 4);
-    let _ = p::write_u32(&mut body, insns.len() as u32);
-    for i in insns {
-        p::write_instruction(&mut body, i.address, &i.assembly, &i.bytes);
+/// Wrap a fallibly-encoded response body: encoding only fails when a field
+/// exceeds the protocol's MAX_FRAME cap, which becomes an in-band
+/// ERR_PROTOCOL reply instead of killing the daemon.
+fn ok_or_protocol(flags: u8, body: std::io::Result<Vec<u8>>) -> (u8, u8, Vec<u8>) {
+    match body {
+        Ok(body) => (status::OK, flags, body),
+        Err(e)   => protocol_err_response(&format!("encode response: {e}")),
     }
-    body
 }
 
-fn encode_relocs(body: &mut Vec<u8>, relocs: &[nyxstone_tricore_gcc::RelocationInfo]) {
-    let _ = p::write_u32(body, relocs.len() as u32);
+fn encode_instructions(insns: &[nyxstone_tricore_gcc::Instruction])
+    -> std::io::Result<Vec<u8>>
+{
+    let mut body = Vec::with_capacity(insns.len() * 32 + 4);
+    p::write_u32(&mut body, insns.len() as u32)?;
+    for i in insns {
+        p::write_instruction(&mut body, i.address, &i.assembly, &i.bytes)?;
+    }
+    Ok(body)
+}
+
+fn encode_relocs(body: &mut Vec<u8>, relocs: &[nyxstone_tricore_gcc::RelocationInfo])
+    -> std::io::Result<()>
+{
+    p::write_u32(body, relocs.len() as u32)?;
     for r in relocs {
         p::write_relocation(body, r.offset, r.addend, r.relocation_type,
-                            &r.symbol.name, r.symbol.address);
+                            &r.symbol.name, r.symbol.address)?;
     }
+    Ok(())
 }
 
 fn err_response(e: nyxstone_tricore_gcc::Error) -> (u8, u8, Vec<u8>) {

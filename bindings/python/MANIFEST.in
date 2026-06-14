@@ -1,7 +1,14 @@
 # Include everything the symlinked nyxstone-tricore-gcc/ tree points at, so
 # the sdist is self-contained for pip install from PyPI.
 recursive-include nyxstone-tricore-gcc *
-# Top-level license + readme.
+# CFFI builder consumed by setup.py's cffi_modules hook.
+include build_native.py
+# Readme + license (LICENSE is a copy of bindings/LICENSE; paths outside the
+# project root would be silently skipped by setuptools).
 include README.md
-include ../../LICENSE
-include ../../LICENSE-MIT
+include LICENSE
+# Never ship build outputs or generated CFFI artifacts.
+prune build
+prune dist
+recursive-exclude nyxstone_tricore_gcc _native.*
+global-exclude *.py[cod] __pycache__

@@ -81,20 +81,58 @@ fn main() {
     cc.compile("nyxstone_tricore_c");
 
     // ---- 4. Link binutils archives + every gas .o -------------------------
+    // The gas/binutils .o files must reach the *final* link of whatever
+    // binary ultimately depends on this crate.  `cargo:rustc-link-arg=<x>.o`
+    // does NOT propagate to dependent crates (a downstream crate would fail
+    // with e.g. `undefined symbol: now_seg`), so instead we archive the
+    // objects into a static library in OUT_DIR and emit
+    // rustc-link-search/rustc-link-lib directives, which cargo DOES carry to
+    // the final downstream link.
+    //
+    // Modifiers:
+    //  - `+whole-archive` on the gas objects: some gas globals/constructors
+    //    are unreferenced at link time but required at runtime; every member
+    //    must be kept (this matches the old per-.o force-linking behavior).
+    //  - `-bundle` everywhere: `+whole-archive,+bundle` is rejected when
+    //    building rlibs, and non-bundled libs are emitted on the final link
+    //    line in directive order, which keeps single-pass link order intact:
+    //    gas objects first, then libopcodes/libbfd/libiberty/libsframe that
+    //    they depend on, then the system libs below.
     let lib = extracted.join("lib");
-    println!("cargo:rustc-link-search=native={}", lib.display());
-    for l in &["opcodes", "bfd", "iberty", "sframe"] {
-        println!("cargo:rustc-link-lib=static={l}");
-    }
+    let mut objs: Vec<PathBuf> = Vec::new();
     for d in &["gas", "gas/config"] {
         let dir = lib.join(d);
         if !dir.is_dir() { continue; }
         for entry in std::fs::read_dir(&dir).expect("gas/ exists") {
             let p = entry.unwrap().path();
             if p.extension().and_then(|s| s.to_str()) == Some("o") {
-                println!("cargo:rustc-link-arg={}", p.display());
+                objs.push(p);
             }
         }
+    }
+    assert!(!objs.is_empty(), "no gas .o files found under {}", lib.display());
+    objs.sort();
+
+    let archive = out_dir.join("libnyxstone_gasobjs.a");
+    // Remove any stale archive first: `ar r` replaces members by name but
+    // would silently keep members whose source .o has since disappeared.
+    let _ = std::fs::remove_file(&archive);
+    let ar = env::var("AR").unwrap_or_else(|_| "ar".to_string());
+    let status = Command::new(&ar)
+        .arg("crs")
+        .arg(&archive)
+        .args(&objs)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run `{ar}` (set $AR?): {e}"));
+    if !status.success() {
+        panic!("`{ar} crs {}` failed (status {status})", archive.display());
+    }
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static:+whole-archive,-bundle=nyxstone_gasobjs");
+    println!("cargo:rustc-link-search=native={}", lib.display());
+    for l in &["opcodes", "bfd", "iberty", "sframe"] {
+        println!("cargo:rustc-link-lib=static:-bundle={l}");
     }
     for sys in &["z", "zstd", "dl", "m", "stdc++"] {
         println!("cargo:rustc-link-lib={sys}");

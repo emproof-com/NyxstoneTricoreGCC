@@ -42,6 +42,12 @@ impl Daemon {
         let bin = locate_daemon()?;
         spawn_with(&bin)
     }
+
+    /// Pid of the daemon child (test hook for kill/respawn coverage).
+    #[cfg(test)]
+    pub(crate) fn pid(&self) -> u32 {
+        self.process.id()
+    }
 }
 
 impl Drop for Daemon {

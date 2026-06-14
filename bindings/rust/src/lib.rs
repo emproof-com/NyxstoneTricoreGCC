@@ -62,6 +62,13 @@ use std::sync::Mutex;
 // surface is safe even when threads try to use the library at the same time.
 static GLOBAL_LOCK: Mutex<()> = Mutex::new(());
 
+/// Take the global gas lock, ignoring poisoning: no panic can occur mid-C-call
+/// (all Rust-side validation happens before the lock is taken), so a panicking
+/// thread cannot leave the guarded gas state corrupted.
+fn lock_gas() -> std::sync::MutexGuard<'static, ()> {
+    GLOBAL_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Convenience alias matching the public C++/Rust API contract.
 pub type Address = u64;
 
@@ -191,7 +198,7 @@ impl NyxstoneTricoreGCC {
     /// Create a new NyxstoneTricoreGCC.  The first call in a process
     /// performs gas's one-time init; subsequent calls reuse it.
     pub fn new() -> Result<Self, Error> {
-        let _g = GLOBAL_LOCK.lock().unwrap();
+        let _g = lock_gas();
         let mut err: *mut c_char = ptr::null_mut();
         let p = unsafe { ffi::nyxstone_create(&mut err) };
         if p.is_null() { return Err(Error::Init(take_err(err))); }
@@ -200,20 +207,26 @@ impl NyxstoneTricoreGCC {
 
     /// Build a `Vec<nyxstone_label_def_t>` plus the owned CStrings that back the
     /// `name` pointers.  Keep the CStrings alive until the C call returns.
+    ///
+    /// Returns an error for label names with interior NUL bytes.  Callers must
+    /// invoke this BEFORE taking `GLOBAL_LOCK` so validation failures can never
+    /// panic (or bail) while the global gas lock is held.
     fn pack_labels(labels: &[LabelDefinition])
-        -> (Vec<ffi::nyxstone_label_def_t>, Vec<CString>)
+        -> Result<(Vec<ffi::nyxstone_label_def_t>, Vec<CString>), Error>
     {
         let owned: Vec<CString> = labels.iter()
-            .map(|l| CString::new(l.name.as_str())
-                .expect("label name must not contain interior NUL"))
-            .collect();
+            .map(|l| CString::new(l.name.as_str()).map_err(|_| {
+                Error::AssembleFailed(format!(
+                    "label name {:?} contains an interior NUL byte", l.name))
+            }))
+            .collect::<Result<_, _>>()?;
         let raw: Vec<ffi::nyxstone_label_def_t> = owned.iter().zip(labels)
             .map(|(n, l)| ffi::nyxstone_label_def_t {
                 name:    n.as_ptr(),
                 address: l.address,
             })
             .collect();
-        (raw, owned)
+        Ok((raw, owned))
     }
 
     /// Translate assembly to `.text` bytes at the given absolute `address`,
@@ -224,8 +237,8 @@ impl NyxstoneTricoreGCC {
         address: u64,
         labels: &[LabelDefinition],
     ) -> Result<Vec<u8>, Error> {
-        let _g = GLOBAL_LOCK.lock().unwrap();
-        let (raw, _owned) = Self::pack_labels(labels);
+        let (raw, _owned) = Self::pack_labels(labels)?; // validate before locking
+        let _g = lock_gas();
         let mut out:  *mut u8 = ptr::null_mut();
         let mut nlen: usize   = 0;
         let mut err:  *mut c_char = ptr::null_mut();
@@ -254,8 +267,8 @@ impl NyxstoneTricoreGCC {
         address: u64,
         labels: &[LabelDefinition],
     ) -> Result<Vec<Instruction>, Error> {
-        let _g = GLOBAL_LOCK.lock().unwrap();
-        let (raw, _owned) = Self::pack_labels(labels);
+        let (raw, _owned) = Self::pack_labels(labels)?; // validate before locking
+        let _g = lock_gas();
         let mut out: *mut ffi::nyxstone_instruction_t = ptr::null_mut();
         let mut n:   usize = 0;
         let mut err: *mut c_char = ptr::null_mut();
@@ -281,7 +294,7 @@ impl NyxstoneTricoreGCC {
         address: u64,
         count: usize,
     ) -> Result<String, Error> {
-        let _g = GLOBAL_LOCK.lock().unwrap();
+        let _g = lock_gas();
         let mut out: *mut c_char = ptr::null_mut();
         let mut err: *mut c_char = ptr::null_mut();
         let s = unsafe {
@@ -307,7 +320,7 @@ impl NyxstoneTricoreGCC {
         address: u64,
         count: usize,
     ) -> Result<Vec<Instruction>, Error> {
-        let _g = GLOBAL_LOCK.lock().unwrap();
+        let _g = lock_gas();
         let mut out: *mut ffi::nyxstone_instruction_t = ptr::null_mut();
         let mut n:   usize = 0;
         let mut err: *mut c_char = ptr::null_mut();
@@ -330,14 +343,20 @@ impl NyxstoneTricoreGCC {
     /// Like [`assemble`](Self::assemble) but leaves @p labels unresolved and
     /// returns one [`RelocationInfo`] per external reference, the same shape
     /// gas/gcc emits with `-r`.
+    ///
+    /// Unlike the plain paths, an undefined symbol is NOT an error here --
+    /// this is the link-later path.  Each undefined reference stays as zero
+    /// placeholder bytes in the stream and is described by a relocation
+    /// record; `labels` may be empty and only fills the `symbol.address`
+    /// hint field of matching records.
     pub fn assemble_with_relocs(
         &self,
         source: &str,
         address: Address,
         labels: &[LabelDefinition],
     ) -> Result<(Vec<u8>, Vec<RelocationInfo>), Error> {
-        let _g = GLOBAL_LOCK.lock().unwrap();
-        let (raw, _owned) = Self::pack_labels(labels);
+        let (raw, _owned) = Self::pack_labels(labels)?; // validate before locking
+        let _g = lock_gas();
         let mut out_b:  *mut u8 = ptr::null_mut();
         let mut nlen:   usize   = 0;
         let mut out_r:  *mut ffi::nyxstone_reloc_t = ptr::null_mut();
@@ -366,15 +385,20 @@ impl NyxstoneTricoreGCC {
     }
 
     /// Like [`assemble_to_instructions`](Self::assemble_to_instructions)
-    /// but with `-r`-style relocation output.
+    /// but with `-r`-style relocation output (see
+    /// [`assemble_with_relocs`](Self::assemble_with_relocs) for the
+    /// undefined-symbol semantics).  The per-instruction text decodes the
+    /// placeholder bytes, so a relocation site prints with displacement 0,
+    /// like objdump on an unlinked object; correlate `Instruction.address`
+    /// with the relocation offsets to find the sites the linker patches.
     pub fn assemble_to_instructions_with_relocs(
         &self,
         source: &str,
         address: Address,
         labels: &[LabelDefinition],
     ) -> Result<(Vec<Instruction>, Vec<RelocationInfo>), Error> {
-        let _g = GLOBAL_LOCK.lock().unwrap();
-        let (raw, _owned) = Self::pack_labels(labels);
+        let (raw, _owned) = Self::pack_labels(labels)?; // validate before locking
+        let _g = lock_gas();
         let mut out_i:  *mut ffi::nyxstone_instruction_t = ptr::null_mut();
         let mut ilen:   usize   = 0;
         let mut out_r:  *mut ffi::nyxstone_reloc_t = ptr::null_mut();
@@ -419,9 +443,12 @@ fn unpack_instructions(out: *mut ffi::nyxstone_instruction_t, n: usize) -> Vec<I
     let mut v = Vec::with_capacity(n);
     for i in 0..n {
         let p = unsafe { &*out.add(i) };
-        let assembly = unsafe { CStr::from_ptr(p.assembly as *const c_char) }
-            .to_string_lossy()
-            .into_owned();
+        // Match the reloc-unpacking path: a NULL string from the C side maps
+        // to an empty string instead of being dereferenced.
+        let assembly = if p.assembly.is_null() { String::new() }
+                       else { unsafe { CStr::from_ptr(p.assembly as *const c_char) }
+                                  .to_string_lossy()
+                                  .into_owned() };
         let bytes = if p.bytes.is_null() || p.bytes_len == 0 { Vec::new() }
                     else { unsafe { std::slice::from_raw_parts(p.bytes, p.bytes_len) }.to_vec() };
         v.push(Instruction { address: p.address, assembly, bytes });
@@ -432,7 +459,7 @@ fn unpack_instructions(out: *mut ffi::nyxstone_instruction_t, n: usize) -> Vec<I
 
 impl Drop for NyxstoneTricoreGCC {
     fn drop(&mut self) {
-        let _g = GLOBAL_LOCK.lock().unwrap();
+        let _g = lock_gas();
         unsafe { ffi::nyxstone_destroy(self.inner); }
     }
 }
@@ -475,6 +502,24 @@ mod tests {
         let ext = nx.assemble("nop\n nop\n j ext\n", 0, &labels).unwrap();
         assert_eq!(ext.len(), 8); // nop nop (4) + long j (4)
         assert_eq!(ext[4], 0x1d);
+    }
+
+    #[test]
+    fn data_symbol_references() {
+        let nx = NyxstoneTricoreGCC::new().unwrap();
+        // `.word` to a local label encodes its absolute address (base+offset),
+        // instead of being silently dropped.  nop(2)+.word(4)+ret(2); here@+6.
+        let b = nx.assemble("start:\n nop\n .word here\nhere:\n ret\n", 0x1000, &[]).unwrap();
+        assert_eq!(&b[2..6], &[0x06, 0x10, 0x00, 0x00]);
+        // A label difference folds to a constant (b - a == 4 bytes).
+        let b = nx.assemble("a:\n nop\n nop\nb:\n .word b - a\n", 0x1000, &[]).unwrap();
+        assert_eq!(&b[4..8], &[0x04, 0x00, 0x00, 0x00]);
+        // Pure-literal data lists still take the fast path unchanged.
+        assert_eq!(nx.assemble(".word 0x11223344\n", 0, &[]).unwrap(),
+                   vec![0x44, 0x33, 0x22, 0x11]);
+        // `.short`/`.byte` to a local label take the low bits of the address.
+        let b = nx.assemble("l:\n nop\n .short l\n", 0x1000, &[]).unwrap();
+        assert_eq!(&b[2..4], &[0x00, 0x10]);
     }
 
     #[test]
@@ -527,6 +572,18 @@ mod tests {
         let b = nx.assemble("nop\n nop\n nop\n j ext\n", 0x1000, &labels).unwrap();
         // 3 nop (6 bytes) + 4-byte j to absolute symbol = 10 bytes total.
         assert_eq!(b.len(), 10);
+    }
+
+    #[test]
+    fn label_with_interior_nul_is_error_not_panic() {
+        let nx = NyxstoneTricoreGCC::new().unwrap();
+        // A NUL inside a label name must surface as Err, not panic (a panic
+        // here used to poison GLOBAL_LOCK and abort the process in Drop).
+        let labels = [LabelDefinition::new("bad\0name", 0x1000)];
+        let err = nx.assemble("j ext\n", 0, &labels).unwrap_err();
+        assert!(matches!(err, Error::AssembleFailed(_)), "{err:?}");
+        // The global lock must remain usable afterwards.
+        assert_eq!(nx.assemble("nop", 0, &[]).unwrap(), vec![0x00, 0x00]);
     }
 
     #[test]

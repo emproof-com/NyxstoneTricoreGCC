@@ -2,15 +2,36 @@
 // etc.).  Wraps the C++ NyxstoneTricoreGCC class.
 //
 // API shape mirrors the sibling project Nyxstone
-// (https://github.com/emproof-com/nyxstone, LLVM-MC based), four entry
-// points named `assemble`, `assemble_to_instructions`, `disassemble`, and
-// `disassemble_to_instructions`, all taking an explicit `address` and (for
-// the assembly entry points) an optional array of `LabelDefinition`s.
+// (https://github.com/emproof-com/nyxstone, LLVM-MC based): six entry
+// points named `assemble`, `assemble_to_instructions`,
+// `assemble_with_relocs`, `assemble_to_instructions_with_relocs`,
+// `disassemble`, and `disassemble_to_instructions` (the two `_with_relocs`
+// variants are NyxstoneTricoreGCC extensions), all taking an explicit
+// `address` and (for the assembly entry points) an optional array of
+// `LabelDefinition`s.
 //
 // All "handle" types are opaque pointers.  All buffers returned to the
 // caller are heap-allocated; free them with the matching `nyxstone_free_*`
-// helper.  On failure, *out_err (when present) holds a malloc'd error
-// string the caller must free via nyxstone_free_string.
+// helper.
+//
+// Error reporting contract: every function taking an `out_err` parameter
+// sets *out_err to NULL on entry (when out_err itself is non-NULL).  On
+// failure, *out_err is set to a malloc'd error string when allocation
+// permits (it may stay NULL under memory exhaustion); free it via
+// nyxstone_free_string.  All other failure paths -- including NULL-argument
+// rejection -- set a message too.
+//
+// Output contract: on any failure return, all output parameters are
+// NULL / 0; nothing is handed to the caller that would need freeing.
+//
+// Pointer/length pairs: every (pointer, length) input pair -- `labels` /
+// `labels_len` and `bytes` / `bytes_len` -- accepts a NULL pointer if and
+// only if the length is 0 (treated as empty input); a NULL pointer with a
+// non-zero length yields NYXSTONE_ERR_NULL_ARG.
+//
+// No C++ exception ever crosses this ABI: internal exceptions (e.g.
+// std::bad_alloc) are caught and reported as NYXSTONE_ERR_ALLOC (or, for
+// nyxstone_create, a NULL return) with *out_err carrying the message.
 //
 // Threading: single-threaded only.  All gas globals are process-wide; do
 // not hold two NyxstoneTricoreGCC handles concurrently from different threads.
@@ -85,11 +106,14 @@ void nyxstone_destroy(nyxstone_handle_t* h);
    external label definitions.
 
    `source` need not be null-terminated; `src_len` bytes are read.
-   `labels` may be NULL when `labels_len == 0`.
+   `labels` may be NULL only when `labels_len == 0`; a NULL `labels` with
+   `labels_len > 0` returns NYXSTONE_ERR_NULL_ARG.
 
    On success, *out_bytes is a malloc'd buffer of *out_len bytes; free via
-   nyxstone_free_bytes.  On failure, *out_bytes is NULL and (if `out_err` is
-   non-NULL) *out_err carries a malloc'd error string. */
+   nyxstone_free_bytes.  If `source` assembles to zero bytes, the call
+   succeeds with *out_bytes == NULL and *out_len == 0.  On failure,
+   *out_bytes is NULL, *out_len is 0, and (if `out_err` is non-NULL)
+   *out_err carries a malloc'd error string. */
 nyxstone_status_t nyxstone_assemble(
     nyxstone_handle_t* h,
     const char* source, size_t src_len,
@@ -115,7 +139,10 @@ nyxstone_status_t nyxstone_assemble_to_instructions(
    undefined) are left as zero placeholders in `out_bytes`; their
    resolution is described by the `out_relocs` array.  Free
    `out_bytes` with nyxstone_free_bytes and `out_relocs` with
-   nyxstone_free_relocations(arr, *out_relocs_n). */
+   nyxstone_free_relocations(arr, *out_relocs_n).
+
+   Outputs are all-or-nothing: on failure both `out_bytes` and `out_relocs`
+   are NULL (lengths 0); the caller never has to free a partial result. */
 nyxstone_status_t nyxstone_assemble_with_relocs(
     nyxstone_handle_t* h,
     const char* source, size_t src_len,
@@ -140,6 +167,9 @@ nyxstone_status_t nyxstone_assemble_to_instructions_with_relocs(
 
 /* Disassemble `bytes` starting at absolute `address`.  Decodes at most
    `count` instructions; pass 0 for "all".
+
+   `bytes` may be NULL only when `bytes_len == 0` (treated as empty input);
+   a NULL `bytes` with `bytes_len > 0` returns NYXSTONE_ERR_NULL_ARG.
 
    On success, *out_text is a malloc'd null-terminated string with one
    instruction per line.  Free via nyxstone_free_string. */

@@ -17,9 +17,9 @@ use nyxstone_tricore_gcc::{LabelDefinition, NyxstoneTricoreGCC};
 
 let nx = NyxstoneTricoreGCC::new()?;
 
-// Assemble.
+// Assemble.  `j here` relaxes to its 2-byte short form (disp 0x01).
 let bytes = nx.assemble("start:\n nop\n j here\nhere:\n ret\n", 0, &[])?;
-assert_eq!(bytes, [0x00, 0x00, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x90]);
+assert_eq!(bytes, [0x00, 0x00, 0x3c, 0x01, 0x00, 0x90]);
 
 // Assemble with an external label.
 let bytes2 = nx.assemble(

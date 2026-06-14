@@ -44,13 +44,24 @@ same argument order (`source` / `bytes`, `address`, then either `labels` or
 | `disassemble_to_instructions` | bytes → per-insn records |
 
 - **No fork/exec in the hot path.** All work happens in the calling process
-  (or in a single long-lived daemon for the MIT-licensed Rust binding).
+  (or in a long-lived per-instance daemon for the MIT-licensed Rust binding).
 - **`.text`-only.** Any directive that would switch the active section to
   anything other than `.text` makes `assemble()` fail.
 - **Stock binutils.** Uses an unmodified `emproof-com/tricore-binutils-gdb`
   build, no patches to gas, libbfd, or libopcodes.
 - **Byte-equivalent to `tricore-elf-as`.** PC-relative branches with forward
-  references go through a mini relax + `md_apply_fix` pass.
+  references go through a mini relax + `md_apply_fix` pass; `.align`/`.org`
+  padding is sized *after* relaxation, exactly like gas.
+- **Loud failures, real diagnostics.** gas's stderr is captured and embedded
+  in the returned error (`Error: Opcode/operand mismatch: mov %d0, 0x123456`),
+  never printed to the host process.  In the plain `assemble` /
+  `assemble_to_instructions` paths, references to labels that are neither
+  defined in the source nor supplied via `LabelDefinition` are an error, not
+  a silent zero displacement; same for `.org` moving backwards, unknown
+  directives, and out-of-range branch displacements.  The `*_with_relocs`
+  variants are the link-later path: undefined references are *not* an error
+  there -- each one comes back as a relocation record (zero placeholder bytes
+  + `R_TRICORE_*` entry, gas `-r` style) for the linker to resolve.
 
 ## License modes
 
@@ -64,9 +75,11 @@ can pick the licensing mode that fits your situation by changing one line in
 | **`nyxstone-tricore-gcc-ipc`** | MIT | IPC to GPL daemon       | ~6 µs   | closed-source / commercially permissive |
 
 The MIT crate spawns a separate daemon binary (`nyxstone-tcd`, GPL-3.0+) and
-talks to it over a `socketpair(2)` UNIX socket, one daemon per parent
-process, lazy-spawn, killed when the parent exits via
-`PR_SET_PDEATHSIG(SIGTERM)`.  Strict FIFO.  See
+talks to it over a `socketpair(2)` UNIX socket, one daemon per
+`NyxstoneTricoreGCC` instance, lazy-spawn, exiting when the instance is
+dropped or the parent dies (socket EOF; deliberately not `PR_SET_PDEATHSIG`,
+which is thread-scoped).  Strict FIFO, 30 s request timeouts, automatic
+one-shot daemon respawn if it crashes mid-session.  See
 [`bindings/rust-ipc/README.md`](bindings/rust-ipc/README.md) for the binary
 dependency and three daemon-install methods (`cargo install`, `cargo
 binstall`, programmatic bootstrap).
@@ -85,7 +98,7 @@ nopic+pic) on first run, no network access needed:
 # 1. Build the C++ library + tests + examples (~5 s on first run).
 make                    # or:  cmake -S . -B build && cmake --build build -j
 
-# 2. Run the test suite (118 + extra API tests).
+# 2. Run the test suite (155 + extra API tests).
 make test               # or:  ctest --test-dir build --output-on-failure
 
 # 3. Try an example.
@@ -323,7 +336,7 @@ NyxstoneTricoreGCC/
 │   ├── nyxstone.cpp               C++ implementation
 │   ├── nyxstone_glue.c            The only TU that touches gas internals
 │   └── nyxstone_c.cpp             C ABI wrapper
-├── tests/tests.cpp                118-test matrix + stress + round-trip + API checks
+├── tests/tests.cpp                155-test matrix + stress + round-trip + API checks
 ├── examples/{smoke,bench}.cpp     Demo and throughput benchmark
 ├── bindings/
 │   ├── rust/                      nyxstone-tricore-gcc (GPL) crate + nyxstone-tcd daemon
@@ -344,46 +357,66 @@ NyxstoneTricoreGCC/
 
 ## Tests
 
-`tests/tests.cpp` ships a 118-test matrix split into six groups:
+`tests/tests.cpp` ships a 155-test matrix split into eleven groups:
 
-- **insn** (46): every TriCore format we exercise (SR/SRR/SLR/SSR/SC/SRC/RC/
+- **insn** (47): every TriCore format we exercise (SR/SRR/SLR/SSR/SC/SRC/RC/
   RR/RLC/B), various register kinds, immediate widths, signedness.
 - **label** (12): forward + backward branches, multi-label lines
   (`a: b: nop`), `.L0`/`$x`/`_x` naming variants, label-only sources.
-- **data** (40): every data directive Nyxstone supports, `.byte` /
-  `.half` / `.short` / `.2byte` / `.word` / `.int` / `.long` / `.4byte` /
-  `.quad` / `.8byte` / `.ascii` / `.asciz` / `.string` / `.skip` /
-  `.space` / `.zero` / `.org` / `.align` / `.balign`.
+- **relax** (2): local branches shrink to their 2-byte short form in both
+  directions.
+- **data** (36): every data directive Nyxstone supports, `.byte` /
+  `.half` / `.hword` / `.short` / `.2byte` / `.word` / `.int` / `.long` /
+  `.4byte` / `.quad` / `.8byte` / `.ascii` / `.asciz` / `.string` /
+  `.skip` / `.space` / `.zero` / `.org` / `.align` / `.balign`.
 - **mixed** (4): instructions + labels + data interleaved.
 - **edge** (9): empty / comments-only / whitespace / `;` separators.
-- **forbid** (10): `.text`-only restriction, `.data` / `.bss` /
+- **forbid** (7+3): `.text`-only restriction, `.data` / `.bss` /
   `.section .foo` / `.pushsection` must all reject; `.text` / `.section
   .text*` must accept.
+- **quote** (5): `#` / `;` / `//` inside string literals survive the
+  tokenizer (`.asciz "a#b"` keeps its hash).
+- **dirsem** (13): `.skip`/`.space`/`.align` fill operands, `.align`
+  max-skip, `.p2align`, `.equ`/`.set` constants and label expressions,
+  numeric local labels (`1:` / `1b` / `1f`, including instance reuse).
+- **alignrelax** (4): `.align`/`.org` padding is sized *after* branch
+  relaxation -- a shrinking branch before the directive must not shift
+  the alignment.
+- **error** (13): undefined labels, unknown directives/mnemonics,
+  duplicate labels, `.org` backwards, non-power-of-2 `.balign`,
+  out-of-range immediates -- all must reject instead of emitting silently
+  wrong bytes.
 
 After the core matrix:
 
 - 100× stress per test catches state-reset drift across consecutive
   `assemble()` calls.
 - Every BYTES test of ≥2 bytes is round-tripped through
-  `disassemble_to_instructions()` (97 cases).
-- Additional checks cover `LabelDefinition` external symbols (with
-  address invariance), the `address` parameter propagating to
-  `Instruction.address`, and the `count` parameter limiting decoded
-  instructions.
+  `disassemble_to_instructions()` (121 cases).
+- Additional checks cover `LabelDefinition` external symbols (exact
+  displacement bytes + address invariance), the `address` parameter
+  propagating to `Instruction.address`, the `count` parameter limiting
+  decoded instructions, relocation records, branch displacement semantics
+  (decoded target == label address), data directives referencing symbols,
+  error-message quality (gas diagnostics + offending symbol names must
+  appear in the returned error; nothing leaks to the host stderr), and
+  32-bit masking of printed branch targets.
 
-The Rust crates run the same 10 unit tests (verbatim sources, only the
+The Rust crates run the same unit tests (verbatim sources, only the
 `use` line differs between `nyxstone-tricore-gcc` and `nyxstone-tricore-gcc-ipc`)
-plus one doctest, and produce byte-identical output across both backends.
+plus one doctest each, and produce byte-identical output across both
+backends; the IPC crate adds daemon-resilience tests (kill-then-respawn,
+protocol frame caps).
 
 ```
 $ ./run_tests
-... (118 tests in 6 groups) ...
+... (155 tests in 11 groups) ...
 --- 100x stress (each non-MUST_FAIL test 100 iterations) ---
-  PASS: no drift across 118 non-fail tests * 100 iterations
+  PASS: no drift across 135 non-fail tests * 100 iterations
 --- disassembly round-trip ---
-  97 round-trip pass, 0 fail
+  121 round-trip pass, 0 fail
 --- external label resolution ---
-  2 external-label pass, 0 fail
+  3 external-label pass, 0 fail
 --- assemble_to_instructions address ---
   1 assemble_to_instructions pass, 0 fail
 --- disassemble count ---
@@ -394,9 +427,17 @@ $ ./run_tests
   2 assemble_to_instructions_with_relocs pass, 0 fail
 --- with_relocs ignores internal labels ---
   1 internal-label pass, 0 fail
-Summary: 118 passed, 0 failed, 0 drifts (of 118 tests);
-         97 disasm round-trips passed, 0 failed;
-         12 additional API checks passed, 0 failed
+--- branch displacement (relative references) ---
+  10 branch-displacement pass, 0 fail
+--- data symbol references ---
+  5 data-symbol-reference pass, 0 fail
+--- error message quality ---
+  7 error-message pass, 0 fail
+--- disassembly address masking ---
+  1 address-masking pass, 0 fail
+Summary: 155 passed, 0 failed, 0 drifts (of 155 tests);
+         121 disasm round-trips passed, 0 failed;
+         36 additional API checks passed, 0 failed
 ```
 
 ## Threading

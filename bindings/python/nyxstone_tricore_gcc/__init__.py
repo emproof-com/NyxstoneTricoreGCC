@@ -6,21 +6,25 @@ shape mirrors that of the sibling project
 `Nyxstone <https://github.com/emproof-com/nyxstone>`_, a separate codebase
 built on LLVM-MC, covering the architectures LLVM supports.  This package
 is an independent implementation using GNU binutils to cover TriCore
-(which LLVM-MC has no backend for).  Both projects expose four methods
-named :meth:`NyxstoneTricoreGCC.assemble`,
+(which LLVM-MC has no backend for).  It exposes six methods:
+:meth:`NyxstoneTricoreGCC.assemble`,
 :meth:`NyxstoneTricoreGCC.assemble_to_instructions`,
 :meth:`NyxstoneTricoreGCC.disassemble`, and
-:meth:`NyxstoneTricoreGCC.disassemble_to_instructions`, all taking an
-explicit ``address`` and (for the assembly entry points) an iterable of
+:meth:`NyxstoneTricoreGCC.disassemble_to_instructions` mirror Nyxstone's
+API, while :meth:`NyxstoneTricoreGCC.assemble_with_relocs` and
+:meth:`NyxstoneTricoreGCC.assemble_to_instructions_with_relocs` add
+``gas -r``-style relocation output.  All take an explicit ``address`` and
+(for the assembly entry points) an iterable of
 :class:`LabelDefinition`\\ s for external symbols.
 
 Example::
 
     >>> from nyxstone_tricore_gcc import NyxstoneTricoreGCC
     >>> nx = NyxstoneTricoreGCC()
-    >>> nx.assemble("start:\\n nop\\n j here\\nhere:\\n ret\\n", address=0)
-    b'\\x00\\x00\\x1d\\x00\\x00\\x00\\x00\\x90'
-    >>> for ins in nx.disassemble_to_instructions(b, address=0x80000000):
+    >>> raw = nx.assemble("start:\\n nop\\n j here\\nhere:\\n ret\\n", address=0)
+    >>> raw
+    b'\\x00\\x00<\\x01\\x00\\x90'
+    >>> for ins in nx.disassemble_to_instructions(raw, address=0x80000000):
     ...     print(f"{ins.address:#010x}  {ins.assembly}")
 
 Threading: a process-wide lock serializes calls into the C library because
@@ -136,6 +140,9 @@ def _check(status: int, kind: str, msg: str) -> None:
     if status == _STATUS_INIT:
         raise NyxstoneError(
             f"NyxstoneTricoreGCC init failed (libbfd/elf32-tricore?){detail}")
+    if status == _STATUS_NULL_ARG:
+        raise NyxstoneError(
+            f"{kind}: NULL argument passed to the C API{detail}")
     raise NyxstoneError(f"{kind}: unknown status {status}{detail}")
 
 
@@ -275,6 +282,11 @@ class NyxstoneTricoreGCC:
         one :class:`RelocationInfo` per external reference, equivalent to
         ``gcc/gas -r``.
 
+        Unlike the plain paths, an undefined symbol is NOT an error here --
+        this is the link-later path.  Each undefined reference stays as zero
+        placeholder bytes and is described by a relocation record; ``labels``
+        may be omitted and only fills the ``symbol.address`` hint field.
+
         Returns ``(bytes, relocations)``."""
         raw = assembly.encode("utf-8")
         labels_p, labels_n, _keep = _pack_labels(labels)
@@ -308,7 +320,11 @@ class NyxstoneTricoreGCC:
         labels: Optional[Sequence[LabelDefinition]] = None,
     ) -> "tuple[List[Instruction], List[RelocationInfo]]":
         """Like :meth:`assemble_to_instructions` but with ``-r``-style
-        relocation output.  Returns ``(instructions, relocations)``."""
+        relocation output (see :meth:`assemble_with_relocs` for the
+        undefined-symbol semantics).  Relocation sites decode with
+        displacement 0, like objdump on an unlinked object.
+
+        Returns ``(instructions, relocations)``."""
         raw = assembly.encode("utf-8")
         labels_p, labels_n, _keep = _pack_labels(labels)
         out_i = ffi.new("nyxstone_instruction_t**")

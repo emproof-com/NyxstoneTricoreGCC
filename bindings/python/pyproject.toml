@@ -1,5 +1,6 @@
 [build-system]
-requires      = ["setuptools>=64", "wheel", "cffi>=1.16"]
+# setuptools>=77 for PEP 639 license / license-files keys.
+requires      = ["setuptools>=77", "cffi>=1.16"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +8,8 @@ name            = "nyxstone-tricore-gcc"
 version         = "0.1.2"
 description     = "In-process TriCore assembler/disassembler, Python bindings around binutils-tricore (gas + libopcodes)."
 readme          = "README.md"
-license         = { text = "GPL-3.0-or-later" }
+license         = "GPL-3.0-or-later"
+license-files   = ["LICENSE"]
 requires-python = ">=3.8"
 dependencies    = ["cffi>=1.16"]
 authors         = [{ name = "emproof" }]
@@ -15,8 +17,9 @@ keywords        = ["tricore", "assembler", "disassembler", "embedded", "infineon
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Operating System :: POSIX :: Linux",
+    # License is declared via the SPDX expression above (PEP 639); license
+    # classifiers are deprecated alongside it.
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
@@ -38,5 +41,6 @@ Documentation = "https://github.com/emproof-com/NyxstoneTricoreGCC#readme"
 [tool.setuptools]
 packages = ["nyxstone_tricore_gcc"]
 
-[tool.setuptools.cmdclass]
-# build_ext is configured in setup.py via cffi.
+# The native extension is declared in setup.py via cffi_modules
+# (build_native.py:ffibuilder) plus a build_ext subclass that extracts the
+# bundled binutils-tricore prebuilts at build time.

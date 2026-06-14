@@ -52,6 +52,8 @@ extern int  md_estimate_size_before_relax (fragS *, segT);
 extern void md_convert_frag (bfd *, segT, fragS *);
 extern fragS *frag_alloc (struct obstack *);
 extern int  relax_segment (fragS *, segT, int);
+extern void cons (int nbytes);           /* gas .byte/.word/... emitter */
+extern char *input_line_pointer;         /* gas's current parse cursor */
 
 /* TriCore's branch relax chains (md_relax_table).  Each rs_machine_dependent
    branch frag carries a subtype indexing this table; rlx_more links a subtype
@@ -64,6 +66,74 @@ extern const relax_typeS md_relax_table[];
 extern int    print_insn_tricore (unsigned long, struct disassemble_info *);
 
 static int g_initialized = 0;
+
+/* ----- gas stderr capture ----------------------------------------------- */
+/* gas reports every diagnostic through as_bad/as_warn, which print to the
+   stderr FILE stream (messages.c).  A library must not spam the host
+   process's stderr, and the caller needs the text to produce an actionable
+   error.  While a capture is active we swap the `stderr` global for a
+   fopencookie(3) stream that appends into a growable buffer (glibc-specific,
+   like the rest of the Linux-only daemon machinery).  Single-threaded by
+   contract (see nyxstone.h), so the global swap is safe. */
+
+typedef struct { char *buf; size_t len; size_t cap; } growbuf_t;
+
+static void growbuf_append (growbuf_t *g, const char *data, size_t n)
+{
+    if (g->len + n + 1 > g->cap) {
+        size_t nc = g->cap ? g->cap : 256;
+        while (nc < g->len + n + 1) nc *= 2;
+        char *nb = (char *) realloc (g->buf, nc);
+        if (!nb) return;
+        g->buf = nb;
+        g->cap = nc;
+    }
+    memcpy (g->buf + g->len, data, n);
+    g->len += n;
+    g->buf[g->len] = 0;
+}
+
+static growbuf_t g_caplog;
+static FILE *g_cap_stream    = NULL;
+static FILE *g_saved_stderr  = NULL;
+
+static ssize_t cap_write (void *cookie, const char *data, size_t n)
+{
+    growbuf_append ((growbuf_t *) cookie, data, n);
+    return (ssize_t) n;
+}
+
+void nyxstone_glue_begin_capture (void)
+{
+    g_caplog.len = 0;
+    if (g_caplog.buf) g_caplog.buf[0] = 0;
+    if (!g_cap_stream) {
+        cookie_io_functions_t io = { NULL, cap_write, NULL, NULL };
+        g_cap_stream = fopencookie (&g_caplog, "w", io);
+        if (g_cap_stream) setvbuf (g_cap_stream, NULL, _IONBF, 0);
+    }
+    if (g_cap_stream && !g_saved_stderr) {
+        g_saved_stderr = stderr;
+        stderr = g_cap_stream;
+    }
+}
+
+const char *nyxstone_glue_end_capture (void)
+{
+    if (g_saved_stderr) {
+        fflush (g_cap_stream);
+        stderr = g_saved_stderr;
+        g_saved_stderr = NULL;
+    }
+    return g_caplog.buf ? g_caplog.buf : "";
+}
+
+/* Raise a gas error from the C++ driver (directive validation etc.) so all
+   failures flow through one channel: the error counter + captured text. */
+void nyxstone_glue_error (const char *msg)
+{
+    as_bad ("%s", msg);
+}
 
 /* Name of an unsupported relocation hit while encoding the last assemble's
    local branch displacements (NULL if all were handled).  Aliases bfd's static
@@ -166,6 +236,70 @@ void nyxstone_glue_colon (const char *name)
     colon (name);
 }
 
+/* Define `name` as an absolute symbol holding the full target address.
+   Used for the caller's LabelDefinitions in the plain assemble path.
+
+   Called AFTER the source has been parsed (deliberately): at parse time the
+   name is an undefined symbol, so gas emits the longest, value-independent
+   encoding for branches to it (and relax_branches keeps it there) -- the
+   bytes don't change with the absolute `address` parameter.  Mutating the
+   symbol here, before the fixup pass, is what makes the references resolve:
+   the fixups hold pointers to the parse-time symbolS, so the existing
+   object must be redefined in place (a fresh symbol_new would leave
+   fx_addsy dangling at the undefined one).  apply_text_fixups then encodes
+   PC-relative refs as value - (base + PC) and absolute refs as the value. */
+void nyxstone_glue_define_abs (const char *name, uint64_t value)
+{
+    symbolS *sym = symbol_find (name);
+    if (sym) {
+        if (S_IS_DEFINED (sym)) {
+            as_bad ("label '%s' is defined both in the source and as a "
+                    "LabelDefinition", name);
+            return;
+        }
+        S_SET_SEGMENT (sym, absolute_section);
+        S_SET_VALUE (sym, (valueT) value);
+    } else {
+        sym = symbol_new (name, absolute_section,
+                          &zero_address_frag, (valueT) value);
+        symbol_table_insert (sym);
+    }
+}
+
+/* `.equ name, expr` / `.set name, expr`: route through gas's own `equals`
+   (read.c) so the full expression grammar works (constants, labels,
+   arithmetic).  `equals` expects input_line_pointer to sit ON the `=`. */
+void nyxstone_glue_set_sym (const char *name, const char *value_expr)
+{
+    size_t nlen = strlen (name);
+    size_t vlen = strlen (value_expr);
+    char *nbuf = (char *) malloc (nlen + 1);
+    char *vbuf = (char *) malloc (vlen + 3);
+    if (!nbuf || !vbuf) { free (nbuf); free (vbuf); return; }
+    memcpy (nbuf, name, nlen + 1);
+    vbuf[0] = '=';
+    memcpy (vbuf + 1, value_expr, vlen);
+    vbuf[vlen + 1] = '\n';
+    vbuf[vlen + 2] = '\0';
+
+    char *saved = input_line_pointer;
+    input_line_pointer = vbuf;
+    equals (nbuf, 1 /* allow reassignment, .set semantics */);
+    input_line_pointer = saved;
+    free (nbuf);
+    free (vbuf);
+}
+
+/* Numeric local label definition (`1:`).  gas implements these as "fb"
+   labels: each definition bumps an instance counter and defines a mangled
+   per-instance symbol; `1b`/`1f` references inside operands are resolved
+   by gas's expression parser against the same counter (expr.c). */
+void nyxstone_glue_fb_label (unsigned int n)
+{
+    fb_label_instance_inc (n);
+    colon (fb_label_name (n, 0));
+}
+
 void nyxstone_glue_md_assemble (char *line)
 {
     md_assemble (line);
@@ -178,9 +312,56 @@ void nyxstone_glue_emit_bytes (const uint8_t *p, size_t n)
     memcpy (dst, p, n);
 }
 
+/* Emit a `.byte/.hword/.word/.quad`-style data list whose operands may contain
+   symbols or expressions (e.g. `.word label`, `.word end-start`), by handing
+   the operand string to gas's `cons`.  gas parses the comma-separated
+   expressions, emits `nbytes` little-endian bytes each, and creates fixups for
+   symbolic terms -- which the normal fixup pass then resolves (local) or
+   records as relocations (external).  Pure-integer lists are handled by the
+   faster path in the C++ layer; this is only used when a symbol is present. */
+void nyxstone_glue_emit_cons (const char *args, int nbytes)
+{
+    if (!args) return;
+    size_t len = strlen (args);
+    char *buf = (char *) malloc (len + 2);
+    if (!buf) return;
+    memcpy (buf, args, len);
+    buf[len]     = '\n';     /* statement terminator cons() stops at */
+    buf[len + 1] = '\0';
+
+    char *saved = input_line_pointer;
+    input_line_pointer = buf;
+    cons (nbytes);           /* emits bytes + fixups into the current frag */
+    input_line_pointer = saved;
+    free (buf);
+}
+
 size_t nyxstone_glue_frag_now_fix (void)
 {
     return (size_t) frag_now_fix ();
+}
+
+/* `.align p2[, fill[, max]]`: emit a real rs_align frag (gas frag_align) so
+   the padding participates in relaxation.  Padding emitted at parse time
+   would bake in pre-relax offsets: a preceding branch frag that later
+   shrinks (or an offset measured against the wrong frag) silently
+   misaligns everything after it -- this was the historical bug.  The frag
+   is sized exactly in finalize_align_org() once all branch sizes are
+   final. */
+void nyxstone_glue_align (unsigned int p2, int fill, unsigned int max)
+{
+    frag_align ((int) p2, fill, (int) max);
+}
+
+/* `.org target[, fill]`: rs_org frag; target is the section-relative
+   offset.  Sized in finalize_align_org(), which raises a gas error if the
+   target lies behind the current offset (matching gas's "attempt to move
+   .org backwards"). */
+void nyxstone_glue_org (uint64_t target, int fill)
+{
+    char *p = frag_var (rs_org, 1, 1, (relax_substateT) 0,
+                        (symbolS *) NULL, (offsetT) target, (char *) NULL);
+    *p = (char) fill;
 }
 
 int nyxstone_glue_had_errors (void)
@@ -189,6 +370,25 @@ int nyxstone_glue_had_errors (void)
 }
 
 /* ----- 4. Layout + relax + fixup pass ---------------------------------- */
+/* Fixed-byte count of a frag: closed frags use fr_fix; the live tail frag
+   uses frag_now_fix() (its fr_fix is not written until the frag closes). */
+static size_t frag_fix_size (const frchainS *fc, const fragS *fr)
+{
+    return (fr == fc->frch_last && fr == frag_now)
+           ? (size_t) frag_now_fix ()
+           : (size_t) fr->fr_fix;
+}
+
+/* Fill-repeat byte count of a frag.  Plain frag_more frags are rs_fill with
+   fr_var == 0; rs_align/rs_org frags are converted by finalize_align_org()
+   into rs_fill with fr_var == 1 and fr_offset == pad count. */
+static size_t frag_fill_size (const fragS *fr)
+{
+    if (fr->fr_type == rs_fill && fr->fr_var > 0 && fr->fr_offset > 0)
+        return (size_t) fr->fr_offset * (size_t) fr->fr_var;
+    return 0;
+}
+
 /* Layout pass: walks the frag chain and writes each frag's fr_address as
    its cumulative byte offset.  gas's write_object_file normally does this
    in size_seg()/relax_segment(). */
@@ -200,12 +400,60 @@ static void layout (segT seg)
     for (frchainS *fc = si->frchainP; fc; fc = fc->frch_next) {
         for (fragS *fr = fc->frch_root; fr; fr = fr->fr_next) {
             fr->fr_address = addr;
-            size_t n = (fr == fc->frch_last && fr == frag_now)
-                       ? (size_t) frag_now_fix ()
-                       : (size_t) fr->fr_fix;
-            addr += n;
+            addr += frag_fix_size (fc, fr) + frag_fill_size (fr);
         }
     }
+}
+
+/* Convert rs_align/rs_align_code/rs_org frags into plain rs_fill frags with
+   an exact pad count.  Must run AFTER md_convert_frag has finalized every
+   branch frag's fr_fix (relax only *chooses* sizes; the displacement bytes
+   themselves are encoded later in apply_text_fixups, so converting first is
+   safe) -- the pad of an alignment frag depends only on the exact sizes of
+   everything before it, which a single forward pass accumulates.
+
+   The 1-byte fill pattern was stored by frag_align/nyxstone_glue_org at
+   fr_literal[fr_fix].  An rs_align frag's max-skip (gas: third .align
+   operand) lives in fr_subtype: if the needed pad exceeds it, no padding is
+   emitted, exactly like gas. */
+static void finalize_align_org (segT seg)
+{
+    segment_info_type *si = seg_info (seg);
+    if (!si) return;
+    addressT addr = 0;
+    for (frchainS *fc = si->frchainP; fc; fc = fc->frch_next)
+        for (fragS *fr = fc->frch_root; fr; fr = fr->fr_next) {
+            fr->fr_address = addr;
+            size_t fix = frag_fix_size (fc, fr);
+            size_t pad = 0;
+            if (fr->fr_type == rs_align || fr->fr_type == rs_align_code) {
+                addressT off      = addr + fix;
+                addressT boundary = (addressT) 1 << fr->fr_offset;
+                pad = (size_t) ((boundary - (off & (boundary - 1)))
+                                & (boundary - 1));
+                if (fr->fr_subtype && pad > (size_t) fr->fr_subtype)
+                    pad = 0;   /* max-skip exceeded: skip the alignment */
+                fr->fr_type   = rs_fill;
+                fr->fr_offset = (offsetT) pad;
+                fr->fr_var    = 1;
+            } else if (fr->fr_type == rs_org) {
+                addressT off    = addr + fix;
+                addressT target = (addressT) fr->fr_offset
+                                + (fr->fr_symbol
+                                   ? (addressT) S_GET_VALUE (fr->fr_symbol)
+                                   : 0);
+                if (target < off)
+                    as_bad ("attempt to move .org backwards");
+                else
+                    pad = (size_t) (target - off);
+                fr->fr_type   = rs_fill;
+                fr->fr_offset = (offsetT) pad;
+                fr->fr_var    = 1;
+            } else {
+                pad = frag_fill_size (fr);
+            }
+            addr += fix + pad;
+        }
 }
 
 /* Walk md_relax_table backwards from `sub` to the head (shortest encoding) of
@@ -220,6 +468,17 @@ static relax_substateT chain_head (relax_substateT sub)
             if (md_relax_table[i].rlx_more == sub) { pred = (relax_substateT) i; break; }
         if (!pred) break;
         sub = pred;
+    }
+    return sub;
+}
+
+/* Walk to the *longest* encoding in `sub`'s relax chain (rlx_more == 0). */
+static relax_substateT chain_terminal (relax_substateT sub)
+{
+    for (int guard = 0; guard < MD_RELAX_TABLE_N; ++guard) {
+        relax_substateT next = md_relax_table[sub].rlx_more;
+        if (!next) break;
+        sub = next;
     }
     return sub;
 }
@@ -271,13 +530,20 @@ static void relax_branches (segT seg)
         }
 
     /* Seed cumulative fr_address so relax_segment can compute distances, then
-       reset same-section branch targets to their shortest form. */
+       choose each branch's starting form:
+         - target defined in this section: reset to the shortest form so the
+           relaxer can pick the smallest encoding that reaches;
+         - target outside this section (external/absolute label, or undefined
+           reloc target): force the longest form.  These keep maximum range and
+           a size that doesn't depend on the symbol's absolute value (so e.g.
+           assembling the same source at different addresses is invariant). */
     layout (seg);
     for (frchainS *fc = si->frchainP; fc; fc = fc->frch_next)
         for (fragS *fr = fc->frch_root; fr; fr = fr->fr_next)
-            if (fr->fr_type == rs_machine_dependent && fr->fr_symbol
-                && S_GET_SEGMENT (fr->fr_symbol) == seg)
-                fr->fr_subtype = chain_head (fr->fr_subtype);
+            if (fr->fr_type == rs_machine_dependent && fr->fr_symbol)
+                fr->fr_subtype = (S_GET_SEGMENT (fr->fr_symbol) == seg)
+                               ? chain_head (fr->fr_subtype)
+                               : chain_terminal (fr->fr_subtype);
 
     for (int pass = 0;
          relax_segment (si->frchainP->frch_root, seg, pass) && pass < 32;
@@ -294,19 +560,19 @@ size_t nyxstone_glue_extract_text_bytes (uint8_t *out, size_t cap);
    relaxable branch displacements in place, and the relocation's BFD special
    function returns bfd_reloc_outofrange in this in-process, no-output-bfd
    context.  `value` is the byte displacement (target - PC), `rightshift` scales
-   it to instruction units (2-byte).  Relaxation has already grown the branch to
-   a form whose range covers the target, so the value always fits.
+   it to instruction units (2-byte).
 
-   Returns 1 if the field was encoded, 0 if the relocation's layout isn't one
-   we know how to encode (so the caller can raise a clear error instead of
-   silently emitting a wrong displacement).  Two layouts are handled:
+   Returns 1 if the field was encoded, 0 if the relocation's layout isn't one we
+   know how to encode, and -1 if the (scaled) displacement does not fit the
+   signed field -- so the caller can raise a clear error instead of silently
+   emitting a wrong or truncated displacement.  Two layouts are handled:
      - R_TRICORE_24REL: the B-format displacement is *split* (disp[15:0] -> insn
        bits [31:16], disp[23:16] -> bits [15:8]) -- a contiguous dst_mask can't
        express that, so it's encoded explicitly;
      - any reloc whose dst_mask is a single contiguous run of bits (every other
        TriCore PC-relative branch reloc: 4REL/4REL2/8REL/15REL...), encoded
        generically from the mask.
-   A non-contiguous mask we don't recognise is reported unsupported. */
+   A non-contiguous mask we don't recognise is reported unsupported (0). */
 static int encode_pcrel_field (uint8_t *buf, size_t total, size_t at,
                                reloc_howto_type *howto, long value)
 {
@@ -317,6 +583,7 @@ static int encode_pcrel_field (uint8_t *buf, size_t total, size_t at,
 
     if (howto->name && strcmp (howto->name, "R_TRICORE_24REL") == 0) {
         if (at + 4 > total) return 0;
+        if (enc < -(1L << 23) || enc > (1L << 23) - 1) return -1; /* out of range */
         uint32_t word = (uint32_t) buf[at]
                       | ((uint32_t) buf[at + 1] << 8)
                       | ((uint32_t) buf[at + 2] << 16)
@@ -330,13 +597,23 @@ static int encode_pcrel_field (uint8_t *buf, size_t total, size_t at,
     }
 
     /* Reject a mask with internal gaps: our generic encoder assumes the
-       displacement is one contiguous bitfield, and we don't know the layout
+       value occupies one contiguous bitfield, and we don't know the layout
        of anything else. */
     unsigned shift = 0; while (((mask >> shift) & 1u) == 0) ++shift;
     bfd_vma run = mask >> shift;
     if (run & (run + 1)) return 0;   /* not a single run of 1-bits */
 
-    unsigned nbytes = (mask >> 16) ? 4u : 2u;
+    /* A PC-relative field is a signed displacement `w` bits wide; reject
+       overflow.  Absolute (data) fields are truncated to the field, as gas
+       does, so no range check there. */
+    unsigned w = 0; for (bfd_vma r = run; r; r >>= 1) ++w;
+    if (howto->pc_relative && w >= 1 && w <= 31
+        && (enc < -(1L << (w - 1)) || enc > (1L << (w - 1)) - 1))
+        return -1;   /* out of range for this branch form */
+
+    /* Bytes spanning the field (1 for .byte/8-bit, 2/4 for wider). */
+    unsigned hibit = 0; for (bfd_vma m = mask; m; m >>= 1) ++hibit;
+    unsigned nbytes = (hibit + 7u) / 8u;
     if (at + nbytes > total) return 0;
     uint32_t word = 0;
     for (unsigned i = 0; i < nbytes; ++i)
@@ -350,21 +627,25 @@ static int encode_pcrel_field (uint8_t *buf, size_t total, size_t at,
 
 /* Apply fixups and report the count still unresolved (left as relocations).
 
-   Three cases per fix:
-     - local PC-relative branch (target defined in this section): encode the
-       displacement directly via encode_pcrel_field.  md_apply_fix only records
-       the addend for these relaxable branch relocs and never writes the
-       displacement, so without this every local branch assembles to "jump to
-       self".
-     - any other local fix (e.g. absolute data reference): md_apply_fix writes
-       it correctly.
-     - undefined / external target: md_apply_fix records the addend so
-       nyxstone_glue_collect_relocs can emit a relocation entry.
+   `base` is the address the section is being assembled at (used for absolute
+   references; PC-relative ones are base-independent).
 
-   Local branch encoding happens on a contiguous image of the section (so the
-   displacement is computed from real section offsets) after md_apply_fix has
-   written everything else; the image is then copied back into the frags. */
-static int apply_text_fixups (segT seg)
+   md_apply_fix in this gas port does NOT write a fixup whose symbol is still
+   attached -- it only records the addend and defers to gas's write_object_file,
+   which Nyxstone skips.  That affects *every* reference to a defined symbol
+   (branches AND data like `.word label`), so we encode them ourselves:
+
+     - defined symbol (in this section or absolute via `.equ`): encode the value
+       into the field via encode_pcrel_field.  PC-relative refs use the
+       displacement `target - PC`; absolute refs (data, `movh hi:`, ...) use the
+       absolute address `base + value`.
+     - undefined / external symbol: hand to md_apply_fix, which records the
+       addend so nyxstone_glue_collect_relocs can emit a relocation entry.
+
+   Defined-symbol encoding runs on a contiguous image of the section (so offsets
+   are real) after md_apply_fix has recorded the external addends; the image is
+   then copied back into the frags. */
+static int apply_text_fixups (segT seg, uint64_t base)
 {
     segment_info_type *si = seg_info (seg);
     if (!si) return 0;
@@ -375,10 +656,7 @@ static int apply_text_fixups (segT seg)
         for (fixS *fx = fc->fix_root; fx; fx = fx->fx_next) {
             if (!fx->fx_addsy) continue;
             resolve_symbol_value (fx->fx_addsy);
-            reloc_howto_type *howto = bfd_reloc_type_lookup (stdoutput, fx->fx_r_type);
-            int local_branch = (S_GET_SEGMENT (fx->fx_addsy) == seg)
-                               && howto && howto->pc_relative;
-            if (local_branch) continue;   /* encoded below, on the section image */
+            if (S_IS_DEFINED (fx->fx_addsy)) continue;   /* encoded below */
 
             valueT val = S_GET_VALUE (fx->fx_addsy) + fx->fx_offset;
             if (fx->fx_pcrel) val -= md_pcrel_from_section (fx, seg);
@@ -393,39 +671,69 @@ static int apply_text_fixups (segT seg)
 
     for (frchainS *fc = si->frchainP; fc; fc = fc->frch_next)
         for (fixS *fx = fc->fix_root; fx; fx = fx->fx_next) {
-            if (!fx->fx_addsy) continue;
+            if (!fx->fx_addsy || !S_IS_DEFINED (fx->fx_addsy)) continue;
             reloc_howto_type *howto = bfd_reloc_type_lookup (stdoutput, fx->fx_r_type);
-            if (S_GET_SEGMENT (fx->fx_addsy) != seg || !howto || !howto->pc_relative)
-                continue;
-            long disp = (long) (S_GET_VALUE (fx->fx_addsy) + fx->fx_offset)
-                      - (long) md_pcrel_from_section (fx, seg);
-            if (!encode_pcrel_field (buf, total,
-                                     (size_t) (fx->fx_frag->fr_address + (offsetT) fx->fx_where),
-                                     howto, disp))
+            if (!howto) { g_unsupported_reloc = "<no howto>"; continue; }
+
+            /* Absolute address of the target.  Symbols defined in this section
+               are laid out from 0, so add the assemble base; external symbols
+               (defined absolute via nyxstone_glue_define_abs) already hold their
+               full address. */
+            uint64_t sym_abs = (S_GET_SEGMENT (fx->fx_addsy) == seg)
+                             ? base + (uint64_t) S_GET_VALUE (fx->fx_addsy)
+                             : (uint64_t) S_GET_VALUE (fx->fx_addsy);
+            long value;
+            if (howto->pc_relative)        /* displacement: both sides absolute */
+                value = (long) (sym_abs + fx->fx_offset)
+                      - (long) (base + md_pcrel_from_section (fx, seg));
+            else                            /* absolute reference */
+                value = (long) (sym_abs + fx->fx_offset);
+
+            int rc = encode_pcrel_field (buf, total,
+                                         (size_t) (fx->fx_frag->fr_address + (offsetT) fx->fx_where),
+                                         howto, value);
+            if (rc == 0)
                 g_unsupported_reloc = howto->name ? howto->name : "<unknown>";
+            else if (rc < 0)
+                /* Out of range for the chosen form; raise a gas error so
+                   do_assemble surfaces it instead of emitting truncated bytes. */
+                as_bad ("displacement to '%s' out of range for %s",
+                        S_GET_NAME (fx->fx_addsy),
+                        howto->name ? howto->name : "branch");
         }
 
-    /* Copy the encoded image back into the frag literals. */
+    /* Copy the encoded image back into the frag literals.  Fixups only ever
+       sit in the fixed part of a frag, so fill bytes are skipped (advanced
+       over) but never copied back. */
     addressT addr = 0;
     for (frchainS *fc = si->frchainP; fc; fc = fc->frch_next)
         for (fragS *fr = fc->frch_root; fr; fr = fr->fr_next) {
-            size_t n = (fr == fc->frch_last && fr == frag_now)
-                       ? (size_t) frag_now_fix () : (size_t) fr->fr_fix;
+            size_t n = frag_fix_size (fc, fr);
             if (n && addr + n <= total)
                 memcpy (fr->fr_literal, buf + addr, n);
-            addr += n;
+            addr += n + frag_fill_size (fr);
         }
     free (buf);
     return unresolved;
 }
 
-int nyxstone_glue_resolve_text_fixups (void)
+int nyxstone_glue_resolve_text_fixups (uint64_t base)
 {
     /* Phase order for this gas port, minimised for one section:
-       relax (choose sizes) -> re-layout -> resolve symbols at final addresses
-       -> convert frags to bytes -> apply fixups. */
+         1. relax            -- choose each branch frag's encoding (subtype).
+         2. md_convert_frag  -- emit the chosen opcode bytes; fr_fix becomes
+                                final.  Displacement *values* are NOT baked
+                                here: md_convert_frag emits fixups instead
+                                (see tc-tricore.c), so converting before the
+                                final layout is safe.
+         3. finalize_align_org -- size rs_align/rs_org frags exactly, now
+                                that every fr_fix is final.
+         4. layout           -- final cumulative addresses (fill-aware).
+         5. apply fixups     -- re-resolve symbols at final addresses and
+                                encode every displacement/absolute field.
+       Symbol re-resolution is exact because gas only caches resolved
+       values once `finalize_syms` is set, which we never do. */
     relax_branches (text_section);
-    layout (text_section);
 
     segment_info_type *si = seg_info (text_section);
     if (!si) return 0;
@@ -438,9 +746,10 @@ int nyxstone_glue_resolve_text_fixups (void)
         for (fragS *fr = fc->frch_root; fr; fr = fr->fr_next)
             if (fr->fr_type == rs_machine_dependent)
                 md_convert_frag (stdoutput, text_section, fr);
+    finalize_align_org (text_section);
     layout (text_section);
 
-    return apply_text_fixups (text_section);
+    return apply_text_fixups (text_section, base);
 }
 
 /* Name of a relocation form the local-branch encoder could not handle during
@@ -514,7 +823,8 @@ size_t nyxstone_glue_collect_relocs (nyxstone_glue_reloc_t *out, size_t cap)
    For the in-progress tail frag use frag_now_fix() (live obstack growth).
    Without the latter, the bytes of the only/last insn in a one-line input
    would be missed (their fr_fix is still 0 because frag_new never closed
-   the frag). */
+   the frag).  Fill frags produced by finalize_align_org additionally emit
+   fr_offset repetitions of the fr_var-byte pattern at fr_literal[fr_fix]. */
 size_t nyxstone_glue_extract_text_bytes (uint8_t *out, size_t cap)
 {
     size_t total = 0;
@@ -522,13 +832,21 @@ size_t nyxstone_glue_extract_text_bytes (uint8_t *out, size_t cap)
     if (!si) return 0;
     for (frchainS *fc = si->frchainP; fc; fc = fc->frch_next) {
         for (fragS *fr = fc->frch_root; fr; fr = fr->fr_next) {
-            size_t n = (fr == fc->frch_last && fr == frag_now)
-                       ? (size_t) frag_now_fix ()
-                       : (size_t) fr->fr_fix;
-            if (n == 0) continue;
-            if (out && total + n <= cap)
-                memcpy (out + total, fr->fr_literal, n);
-            total += n;
+            size_t n = frag_fix_size (fc, fr);
+            if (n) {
+                if (out && total + n <= cap)
+                    memcpy (out + total, fr->fr_literal, n);
+                total += n;
+            }
+            size_t fill = frag_fill_size (fr);
+            if (fill) {
+                size_t var = (size_t) fr->fr_var;
+                if (out && total + fill <= cap)
+                    for (size_t i = 0; i < fill; i += var)
+                        memcpy (out + total + i,
+                                fr->fr_literal + fr->fr_fix, var);
+                total += fill;
+            }
         }
     }
     return total;
@@ -595,10 +913,13 @@ static int dis_printf_styled (void *s, enum disassembler_style style, const char
 /* Print a branch/call target address WITHOUT the zero-padding that the
    default generic_print_address (bfd_sprintf_vma -> "%08lx") applies.
    Mirrors objdump's objdump_print_value, which strips leading zeros, so
-   we emit "j 0x1068" instead of "j 0x00001068".  Routes through the same
+   we emit "j 0x1068" instead of "j 0x00001068".  TriCore is a 32-bit
+   target, so like objdump we mask the value to the architecture's address
+   width -- a backward branch near address 0 prints as 0xfffffffe, not as
+   the sign-extended 0xfffffffffffffffe.  Routes through the same
    fprintf_func so the text lands in the same output buffer. */
 static void dis_print_address (bfd_vma addr, struct disassemble_info *info) {
-    (*info->fprintf_func) (info->stream, "0x%" PRIx64, (uint64_t) addr);
+    (*info->fprintf_func) (info->stream, "0x%" PRIx32, (uint32_t) addr);
 }
 
 /* Disassemble one instruction starting at byte offset 0 of `bytes`/`len`.

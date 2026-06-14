@@ -28,7 +28,11 @@ bindings/rust-ipc/Cargo.lock
 bindings/python/build/
 bindings/python/dist/
 bindings/python/*.egg-info/
-bindings/python/nyxstone_tricore/_native.*
-bindings/python/nyxstone_tricore/_native.c
+bindings/python/nyxstone_tricore_gcc/_native.*
+# Absolute-path object trees leaked by old setup.py versions
+# (ffibuilder.compile(tmpdir='.') with resolved source paths); keep these
+# ignored so they can't come back if an old checkout's setup.py runs.
+bindings/python/home/
+bindings/python/workspaces/
 __pycache__/
 *.pyc

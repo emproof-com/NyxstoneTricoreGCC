@@ -3,26 +3,21 @@
 Python bindings to the [NyxstoneTricoreGCC](..) in-process TriCore
 assembler/disassembler.
 
-Uses CFFI to compile a small C extension that statically links the C++
-side (`libnyxstone_tricore.a`) and the binutils archives.  No runtime
-shared library needed.
+Uses CFFI to compile a small C extension directly from the C++/C wrapper
+sources, linking in the bundled binutils-tricore prebuilt archives and gas
+object files.  The build is self-contained -- no prior `make` step and no
+runtime shared library needed.
 
 The API mirrors that of the sibling project
 [Nyxstone](https://github.com/emproof-com/nyxstone) (LLVM-MC based, covers
 LLVM-supported architectures; this package uses GNU binutils for TriCore).
-Four methods named `assemble`, `assemble_to_instructions`, `disassemble`,
-and `disassemble_to_instructions`, each taking an absolute `address` (and
-for the assembly entry points, an iterable of `LabelDefinition`).
+Six methods: `assemble`, `assemble_to_instructions`, `disassemble`, and
+`disassemble_to_instructions` mirror Nyxstone, plus `assemble_with_relocs`
+and `assemble_to_instructions_with_relocs` for `gas -r`-style relocation
+output.  Each takes an absolute `address` (and for the assembly entry
+points, an iterable of `LabelDefinition`).
 
 ## Install
-
-The C++ library must be built first:
-
-```sh
-(cd ..; make)
-```
-
-Then install the Python package:
 
 ```sh
 pip install ./    # from the python/ directory
@@ -32,7 +27,7 @@ Or develop in-place:
 
 ```sh
 python setup.py build_ext --inplace
-python examples/smoke.py
+PYTHONPATH=. python examples/smoke.py
 ```
 
 ## Usage
@@ -42,9 +37,9 @@ from nyxstone_tricore_gcc import LabelDefinition, NyxstoneTricoreGCC
 
 nx = NyxstoneTricoreGCC()
 
-# Assemble.
+# Assemble.  Local branches get their displacement encoded directly.
 bytes_ = nx.assemble("start:\n nop\n j here\nhere:\n ret\n", address=0)
-assert bytes_ == b"\x00\x00\x1d\x00\x00\x00\x00\x90"
+assert bytes_ == b"\x00\x00\x3c\x01\x00\x90"
 
 # Assemble with an external label.
 bytes2 = nx.assemble(
