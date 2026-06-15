@@ -523,6 +523,42 @@ mod tests {
     }
 
     #[test]
+    fn resolution_reloc_encodings() {
+        // Non-linear relocation forms the in-place encoder resolves (faithful
+        // to gas md_apply_fix): the B-format 24-bit split (24ABS), the high-
+        // half carry-adjusted RLC (HIADJ via `hi:`), and the 18-bit absolute
+        // addressing split (18ABS).  A dst_mask heuristic mis-encoded these.
+        let nx = NyxstoneTricoreGCC::new().unwrap();
+        // ja to absolute 0x10 -> 9d 00 08 00 (NOT 0x10000000 from a naive mask).
+        assert_eq!(nx.assemble("ja S\n", 0, &[LabelDefinition::new("S", 0x10)]).unwrap(),
+                   vec![0x9d, 0x00, 0x08, 0x00]);
+        // movh %d0, hi:0x12345678 -> high half 0x1234 in the const16 field.
+        assert_eq!(nx.assemble("movh %d0, hi:S\n", 0, &[LabelDefinition::new("S", 0x12345678)]).unwrap(),
+                   vec![0x7b, 0x40, 0x23, 0x01]);
+        // 18-bit absolute load (used to fail as "unsupported relocation").
+        assert_eq!(nx.assemble("ld.w %d0, S\n", 0, &[LabelDefinition::new("S", 0x100)]).unwrap(),
+                   vec![0x85, 0x00, 0x00, 0x40]);
+        // movh hi: / addi lo: reconstructs the full address (HIADJ + sign-ext LO).
+        let b = nx.assemble("movh %d0, hi:S\n addi %d0, %d0, lo:S\n", 0,
+                            &[LabelDefinition::new("S", 0xabcd)]).unwrap();
+        let dis = nx.disassemble(&b, 0, 0).unwrap();
+        assert!(dis.contains(",1\n") || dis.contains(",1 "), "movh hiadj: {dis:?}");
+        assert!(dis.contains("-21555"), "addi sign-ext lo: {dis:?}");
+    }
+
+    #[test]
+    fn block_comments_stripped() {
+        // /* */ block comments (incl. multi-line) are removed like gas's scrubber.
+        let nx = NyxstoneTricoreGCC::new().unwrap();
+        assert_eq!(nx.assemble("nop /* x */\n", 0, &[]).unwrap(), vec![0x00, 0x00]);
+        assert_eq!(nx.assemble("nop\n/* a\n b */\n ret\n", 0, &[]).unwrap(),
+                   vec![0x00, 0x00, 0x00, 0x90]);
+        // ... but not inside a string literal.
+        assert_eq!(nx.assemble(".asciz \"a/*b*/c\"\n", 0, &[]).unwrap(),
+                   vec![0x61, 0x2f, 0x2a, 0x62, 0x2a, 0x2f, 0x63, 0x00]);
+    }
+
+    #[test]
     fn branch_displacements_resolve() {
         let nx = NyxstoneTricoreGCC::new().unwrap();
         // Forward branch over several instructions must target the label, not

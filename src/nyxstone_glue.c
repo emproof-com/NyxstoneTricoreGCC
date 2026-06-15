@@ -553,76 +553,180 @@ static void relax_branches (segT seg)
 
 size_t nyxstone_glue_extract_text_bytes (uint8_t *out, size_t cap);
 
-/* Encode a PC-relative branch displacement into the instruction word using the
-   relocation's own howto descriptor (destination mask, position, scale).
+/* Read/write a little-endian word of `n` (1/2/4) bytes at buf[at]. */
+static uint32_t rd_le (const uint8_t *buf, size_t at, unsigned n)
+{
+    uint32_t w = 0;
+    for (unsigned i = 0; i < n; ++i) w |= (uint32_t) buf[at + i] << (8u * i);
+    return w;
+}
+static void wr_le (uint8_t *buf, size_t at, unsigned n, uint32_t w)
+{
+    for (unsigned i = 0; i < n; ++i) buf[at + i] = (uint8_t) (w >> (8u * i));
+}
 
-   We do this ourselves because md_apply_fix records the addend but won't write
-   relaxable branch displacements in place, and the relocation's BFD special
-   function returns bfd_reloc_outofrange in this in-process, no-output-bfd
-   context.  `value` is the byte displacement (target - PC), `rightshift` scales
-   it to instruction units (2-byte).
+/* Encode a resolved symbol reference into the instruction/data field in place.
 
-   Returns 1 if the field was encoded, 0 if the relocation's layout isn't one we
-   know how to encode, and -1 if the (scaled) displacement does not fit the
-   signed field -- so the caller can raise a clear error instead of silently
-   emitting a wrong or truncated displacement.  Two layouts are handled:
-     - R_TRICORE_24REL: the B-format displacement is *split* (disp[15:0] -> insn
-       bits [31:16], disp[23:16] -> bits [15:8]) -- a contiguous dst_mask can't
-       express that, so it's encoded explicitly;
-     - any reloc whose dst_mask is a single contiguous run of bits (every other
-       TriCore PC-relative branch reloc: 4REL/4REL2/8REL/15REL...), encoded
-       generically from the mask.
-   A non-contiguous mask we don't recognise is reported unsupported (0). */
+   We do this ourselves because md_apply_fix in this gas port records the addend
+   but never writes a fixup whose symbol is still attached (it defers to
+   write_object_file, which Nyxstone skips); the relocation's BFD special
+   function likewise returns bfd_reloc_outofrange in this no-output-bfd context.
+   So for every *defined* symbol reference -- local branches/data and, in the
+   plain path, every LabelDefinition -- the bytes are written here.
+
+   This is a faithful transcription of tc-tricore.c's md_apply_fix switch: each
+   TriCore relocation form has its own bit layout, and several are NOT a simple
+   shift-and-mask (the B-format 24-bit displacement is split across the word;
+   16OFF/LO2 permute the value; HI/HIADJ take the high half).  Approximating
+   them from howto->dst_mask silently produced wrong bytes, so every form is
+   encoded explicitly, keyed on howto->name; gas's own value placement and range
+   checks are mirrored exactly.
+
+   `value` is the final field value computed by apply_text_fixups: a byte
+   displacement (target - PC) for PC-relative forms, or the absolute target
+   address for the rest.  Returns 1 if encoded, 0 if the relocation form is not
+   one we encode (caller raises a loud "unsupported relocation" error rather
+   than emit wrong bytes), and -1 if the value is illegal/out of range for the
+   form (caller raises an error). */
 static int encode_pcrel_field (uint8_t *buf, size_t total, size_t at,
                                reloc_howto_type *howto, long value)
 {
-    bfd_vma mask = howto->dst_mask;
-    if (!mask || at >= total) return 0;
+    if (at >= total || !howto->name) return 0;
+    /* Names are "R_TRICORE_<FORM>"; compare on the <FORM> suffix. */
+    const char *r = howto->name;
+    if (strncmp (r, "R_TRICORE_", 10) == 0) r += 10;
 
-    long enc = value >> howto->rightshift;          /* arithmetic, signed */
+#define R_IS(s) (strcmp (r, (s)) == 0)
 
-    if (howto->name && strcmp (howto->name, "R_TRICORE_24REL") == 0) {
+    /* ---- data relocations: plain little-endian field, truncated as gas does
+       (md_number_to_chars).  Value is absolute for *ABS, a displacement for
+       *REL.  Also covers the generic BFD_RELOC_8/16/32 howtos by mask. ---- */
+    if (R_IS ("32ABS") || R_IS ("32REL")
+        || howto->dst_mask == 0xffffffffu) {
         if (at + 4 > total) return 0;
-        if (enc < -(1L << 23) || enc > (1L << 23) - 1) return -1; /* out of range */
-        uint32_t word = (uint32_t) buf[at]
-                      | ((uint32_t) buf[at + 1] << 8)
-                      | ((uint32_t) buf[at + 2] << 16)
-                      | ((uint32_t) buf[at + 3] << 24);
-        word = (word & 0x000000ffu)
-             | (((uint32_t) (enc >> 16) & 0xffu) << 8)
-             | (((uint32_t) enc & 0xffffu) << 16);
-        for (unsigned i = 0; i < 4; ++i)
-            buf[at + i] = (uint8_t) (word >> (8u * i));
+        wr_le (buf, at, 4, (uint32_t) value);
+        return 1;
+    }
+    if (R_IS ("16ABS") || (howto->dst_mask == 0xffffu && howto->bitpos == 0)) {
+        if (at + 2 > total) return 0;
+        wr_le (buf, at, 2, (uint32_t) value & 0xffffu);
+        return 1;
+    }
+    if (R_IS ("8ABS") || (howto->dst_mask == 0xffu && howto->bitpos == 0)) {
+        buf[at] = (uint8_t) value;
         return 1;
     }
 
-    /* Reject a mask with internal gaps: our generic encoder assumes the
-       value occupies one contiguous bitfield, and we don't know the layout
-       of anything else. */
-    unsigned shift = 0; while (((mask >> shift) & 1u) == 0) ++shift;
-    bfd_vma run = mask >> shift;
-    if (run & (run + 1)) return 0;   /* not a single run of 1-bits */
+    /* ---- instruction relocations: read the opcode word (its width is encoded
+       in the low bit of the first byte, TriCore's 16/32-bit marker), apply the
+       form-specific placement, write it back. ---- */
+    unsigned len = (buf[at] & 1u) ? 4u : 2u;
+    if (at + len > total) return 0;
+    uint32_t op  = rd_le (buf, at, len);
+    long     val = value;
 
-    /* A PC-relative field is a signed displacement `w` bits wide; reject
-       overflow.  Absolute (data) fields are truncated to the field, as gas
-       does, so no range check there. */
-    unsigned w = 0; for (bfd_vma r = run; r; r >>= 1) ++w;
-    if (howto->pc_relative && w >= 1 && w <= 31
-        && (enc < -(1L << (w - 1)) || enc > (1L << (w - 1)) - 1))
-        return -1;   /* out of range for this branch form */
+    if (R_IS ("24REL")) {
+        if (val & 1) return -1;
+        if (val < -16777216L || val > 16777214L) return -1;
+        val >>= 1;
+        op &= ~(((uint32_t) 0xffff << 16) | (uint32_t) 0xff00);
+        op |= ((uint32_t) (val & 0xffff) << 16);
+        op |= ((uint32_t) (val & 0xff0000) >> 8);
+    } else if (R_IS ("24ABS")) {
+        if ((unsigned long) val & 0x0fe00001UL) return -1;
+        val >>= 1;
+        val |= ((val & 0x78000000L) >> 7);
+        op &= ~(((uint32_t) 0xffff << 16) | (uint32_t) 0xff00);
+        op |= ((uint32_t) (val & 0xffff) << 16);
+        op |= ((uint32_t) (val & 0xff0000) >> 8);
+    } else if (R_IS ("18ABS")) {
+        if ((unsigned long) val & 0x0fffc000UL) return -1;
+        op &= ~0xf3fff000u;
+        op |= ((uint32_t) (val & 0x3f) << 16);
+        op |= ((uint32_t) (val & 0x3c0) << 22);
+        op |= ((uint32_t) (val & 0x3c00) << 12);
+        op |= ((uint32_t) ((unsigned long) val & 0xf0000000UL) >> 16);
+    } else if (R_IS ("18ABS_14")) {
+        if ((unsigned long) val & 0x00003fffUL) return -1;
+        val = (long) ((unsigned long) val >> 14);
+        op &= ~0xf3fff000u;
+        op |= ((uint32_t) (val & 0x3f) << 16);
+        op |= ((uint32_t) (val & 0x3c0) << 22);
+        op |= ((uint32_t) (val & 0x3c00) << 12);
+        op |= ((uint32_t) (val & 0x3c000) >> 2);
+    } else if (R_IS ("HI")) {
+        op &= ~((uint32_t) 0xffff << 12);
+        op |= (((uint32_t) (val >> 16) & 0xffff) << 12);
+    } else if (R_IS ("HIADJ")) {
+        op &= ~((uint32_t) 0xffff << 12);
+        op |= (((uint32_t) ((val + 0x8000) >> 16) & 0xffff) << 12);
+    } else if (R_IS ("LO") || R_IS ("16CONST")) {
+        if (R_IS ("16CONST") && (val < -32768L || val > 32767L)) return -1;
+        op &= ~((uint32_t) 0xffff << 12);
+        op |= (((uint32_t) val & 0xffff) << 12);
+    } else if (R_IS ("LO2") || R_IS ("16OFF")) {
+        if (R_IS ("16OFF") && (val < -32768L || val > 32767L)) return -1;
+        op &= ~(((uint32_t) 0x3f << 16) | ((uint32_t) 0x3c0 << 22)
+                | ((uint32_t) 0xfc00 << 12));
+        op |= ((uint32_t) (val & 0x3f) << 16);
+        op |= ((uint32_t) (val & 0x3c0) << 22);
+        op |= ((uint32_t) (val & 0xfc00) << 12);
+    } else if (R_IS ("10OFF")) {
+        if (val < -512L || val > 511L) return -1;
+        op &= ~(((uint32_t) 0x3f << 16) | ((uint32_t) 0x3c0 << 22));
+        op |= ((uint32_t) (val & 0x3f) << 16);
+        op |= ((uint32_t) (val & 0x3c0) << 22);
+    } else if (R_IS ("15REL")) {
+        if (val & 1) return -1;
+        if (val < -32768L || val > 32766L) return -1;
+        op &= ~((uint32_t) 0x7fff << 16);
+        op |= (((uint32_t) (val >> 1) & 0x7fff) << 16);
+    } else if (R_IS ("8REL")) {
+        if (val & 1) return -1;
+        if (val < -256L || val > 254L) return -1;
+        val >>= 1;
+        op &= ~((uint32_t) 0xff << 8);
+        op |= (((uint32_t) val & 0xff) << 8);
+    } else if (R_IS ("4REL")) {
+        if (val & 1) return -1;
+        if (val < 0L || val > 30L) return -1;
+        val >>= 1;
+        op &= ~((uint32_t) 0xf << 8);
+        op |= (((uint32_t) val & 0xf) << 8);
+    } else if (R_IS ("4REL2")) {
+        if (val & 1) return -1;
+        if (val < -32L || val > -2L) return -1;
+        val >>= 1;
+        op &= ~((uint32_t) 0xf << 8);
+        op |= (((uint32_t) val & 0xf) << 8);
+    } else if (R_IS ("5REL")) {
+        if (val & 1) return -1;
+        if (val < 0L || val > 62L) return -1;
+        val >>= 1;
+        op &= ~(((uint32_t) 0xf << 8) | ((uint32_t) 0x10 << 3));
+        op |= (((uint32_t) val & 0xf) << 8);
+        op |= (((uint32_t) val & 0x10) << 3);
+    } else if (R_IS ("9SCONST")) {
+        if (val < -256L || val > 255L) return -1;
+        op &= ~((uint32_t) 0x1ff << 12);
+        op |= (((uint32_t) val & 0x1ff) << 12);
+    } else if (R_IS ("9ZCONST")) {
+        if ((unsigned long) val & ~511UL) return -1;
+        op &= ~((uint32_t) 0x1ff << 12);
+        op |= ((uint32_t) val << 12);
+    } else if (R_IS ("8CONST")) {
+        if ((unsigned long) val & ~255UL) return -1;
+        op &= ~((uint32_t) 0xff << 8);
+        op |= ((uint32_t) val << 8);
+    } else if (R_IS ("16SM") || R_IS ("10SM") || R_IS ("16SM2")) {
+        return -1;   /* sm: prefix illegal for a resolved constant offset */
+    } else {
+        return 0;    /* form we don't encode: fail loudly, never guess */
+    }
 
-    /* Bytes spanning the field (1 for .byte/8-bit, 2/4 for wider). */
-    unsigned hibit = 0; for (bfd_vma m = mask; m; m >>= 1) ++hibit;
-    unsigned nbytes = (hibit + 7u) / 8u;
-    if (at + nbytes > total) return 0;
-    uint32_t word = 0;
-    for (unsigned i = 0; i < nbytes; ++i)
-        word |= (uint32_t) buf[at + i] << (8u * i);
-    word = (word & ~(uint32_t) mask)
-         | (((uint32_t) enc << shift) & (uint32_t) mask);
-    for (unsigned i = 0; i < nbytes; ++i)
-        buf[at + i] = (uint8_t) (word >> (8u * i));
+    wr_le (buf, at, len, op);
     return 1;
+#undef R_IS
 }
 
 /* Apply fixups and report the count still unresolved (left as relocations).

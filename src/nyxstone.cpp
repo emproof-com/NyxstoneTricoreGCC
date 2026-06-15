@@ -102,6 +102,38 @@ inline void rtrim(std::string& s) {
     while (i > 0 && std::isspace(static_cast<unsigned char>(s[i-1]))) --i;
     s.resize(i);
 }
+// Remove /* ... */ block comments from the whole source before tokenizing.
+// gas's input scrubber (app.c) does this; NyxstoneTricoreGCC parses the source
+// itself and never runs the scrubber, so we replicate it.  Quote-aware: a
+// "..." string literal is copied verbatim.  Each comment (including multi-line
+// ones, which would otherwise be split across statements) becomes a single
+// space so it cannot fuse adjacent tokens.  An unterminated comment is dropped
+// to end of input, matching gas.
+std::string strip_block_comments(const std::string& src) {
+    std::string out;
+    out.reserve(src.size());
+    bool in_str = false;
+    for (size_t i = 0; i < src.size(); ++i) {
+        char c = src[i];
+        if (in_str) {
+            out.push_back(c);
+            if (c == '\\' && i + 1 < src.size()) out.push_back(src[++i]);
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') { in_str = true; out.push_back(c); continue; }
+        if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
+            if (i + 1 < src.size()) ++i;   // land on the '/'; the for-loop ++i steps past it
+            out.push_back(' ');
+            continue;
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
 inline void strip_comment(std::string& s) {
     // Strip `# ...` (gas's TriCore comment char) or `// ...` to end of line,
     // but never inside a "..." string literal -- `.asciz "a#b"` keeps its
@@ -493,7 +525,7 @@ tl::expected<AssembleCore, std::string> do_assemble(
         if (!cur.empty()) process(std::move(cur));
     };
 
-    run(source);
+    run(strip_block_comments(source));
 
     // Plain path: define every LabelDefinition as an absolute symbol holding
     // its full address, so the fixup pass resolves references to it.  This

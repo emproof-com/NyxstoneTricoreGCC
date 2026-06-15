@@ -192,9 +192,38 @@ For each unresolved fix the glue produces:
 | `md_assemble` (TriCore)            | **The encoder.** Bit-packs operands. |
 | `md_estimate_size_before_relax`    | Pick the size class for a relaxable frag |
 | `md_convert_frag`                  | Emit final bytes for a relaxable frag |
-| `md_apply_fix` / `md_pcrel_from_section` | Resolve PC-relative branches |
+| `md_apply_fix` / `md_pcrel_from_section` | Resolve fixes to undefined symbols (records addends) |
 | `as_bad` (via stderr capture)      | Diagnostics; captured into the error string |
 | `bfd_reloc_type_lookup` (libbfd) | Map `fx_r_type` → ELF `R_TRICORE_*` for `assemble_with_relocs` output |
+
+### In-place relocation encoding
+
+This gas port's `md_apply_fix` does **not** write a fixup whose symbol is
+still attached (it records the addend and defers to `write_object_file`,
+which Nyxstone skips), and the BFD special functions return
+`bfd_reloc_outofrange` in this no-output-bfd context.  So for every
+*defined* symbol reference -- local branches/data and, in the plain path,
+every `LabelDefinition` -- the glue writes the field itself, in
+`encode_pcrel_field` (`nyxstone_glue.c`).
+
+That function is a faithful transcription of `md_apply_fix`'s per-relocation
+switch, keyed on `howto->name`, because several TriCore forms are **not** a
+simple shift-and-mask and cannot be derived from `howto->dst_mask`:
+
+- the B-format 24-bit displacement is *split* across the word
+  (`disp[15:0]` → bits [31:16], `disp[23:16]` → bits [15:8]) -- 24REL and
+  the absolute 24ABS (`ja`/`calla`);
+- 16OFF/LO2 *permute* the 16-bit value into three sub-fields;
+- HI/HIADJ take the **high** half (`>> 16`, HIADJ with a `+0x8000` carry
+  adjust so `movh hi: / addi lo:` reconstructs the address);
+- 18ABS is a non-contiguous split for absolute addressing
+  (`lea`/`ld.w`/`st.w`).
+
+An earlier `dst_mask`-heuristic encoder mis-encoded the contiguous-mask but
+swizzled forms (24ABS, 16OFF, LO2) *silently*, and rejected the
+non-contiguous ones (18ABS).  Encoding every form explicitly, with gas's own
+range checks, removes that whole class of error; a relocation form not in
+the switch fails loudly rather than guessing.
 
 ## Section restriction (`.text`-only)
 

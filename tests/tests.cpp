@@ -1,6 +1,6 @@
 // NyxstoneTricoreGCC test suite.
 //
-// 155 matrix tests across eleven groups:
+// 162 matrix tests across twelve groups:
 //   - insn       (47): every TriCore format we exercise.
 //   - label      (12): forward/backward branches, multi-label lines,
 //                       various identifier styles, label-only sources.
@@ -9,7 +9,8 @@
 //   - mixed       (4): instructions + labels + data interleaved.
 //   - edge        (9): empty / comments-only / whitespace / `;` separators.
 //   - forbid   (7+3): Nyxstone-style .text-only restriction (+ accepted).
-//   - quote       (5): `#`/`;`/`//` inside string literals.
+//   - quote       (6): `#`/`;`/`//`/`/* */` inside string literals.
+//   - comment     (6): `/* */` block comments (incl. multi-line) stripped.
 //   - dirsem     (13): fill operands, .equ/.set, numeric local labels,
 //                       .p2align, alignment fill/max-skip.
 //   - alignrelax  (4): .align/.org padding sized after branch relaxation.
@@ -28,7 +29,10 @@
 // catch state-reset drift across consecutive assemble() calls.  Post-matrix
 // checks cover disassembly round-trips, external label resolution (exact
 // displacement bytes), relocations, branch displacement semantics, data
-// symbol references, error-message quality, and 32-bit address masking.
+// symbol references, resolution-path relocation encodings (24ABS/HI/HIADJ/
+// 18ABS and other non-linear forms), relocation offsets through
+// relaxation/alignment, the data fast-path vs gas's cons, an instruction
+// idempotence corpus, error-message quality, and 32-bit address masking.
 
 #include "nyxstone/nyxstone.h"
 
@@ -236,6 +240,18 @@ const std::vector<Test> TESTS = {
     {"quote", "// inside string",      ".ascii \"a//b\"\n",                   BYTES, B({0x61, 0x2f, 0x2f, 0x62})},
     {"quote", "escaped quote + #",     ".ascii \"a\\\"#\"\n",                 BYTES, B({0x61, 0x22, 0x23})},
     {"quote", "comment after string",  ".ascii \"ab\"  # trailing\n",         BYTES, B({0x61, 0x62})},
+    {"quote", "/* */ not in string",   ".asciz \"a/*b*/c\"\n",                BYTES, B({0x61, 0x2f, 0x2a, 0x62, 0x2a, 0x2f, 0x63, 0x00})},
+
+    // -------------------------------------------------------------------------
+    // comment, /* */ block comments are stripped (gas scrubber parity), even
+    // mid-line and spanning statements / newlines.
+    // -------------------------------------------------------------------------
+    {"comment", "block mid-line",      "nop /* x */\n",                       BYTES, B({0x00, 0x00})},
+    {"comment", "block whole line",    "/* hi */\n nop\n",                    BYTES, B({0x00, 0x00})},
+    {"comment", "block multi-line",    "nop\n/* a\n b */\n ret\n",            BYTES, B({0x00, 0x00, 0x00, 0x90})},
+    {"comment", "block then insn",     "/* c */ ret\n",                       BYTES, B({0x00, 0x90})},
+    {"comment", "block splits tokens", "nop/* */\nret\n",                     BYTES, B({0x00, 0x00, 0x00, 0x90})},
+    {"comment", "unterminated block",  "nop\n/* dangling\n",                  BYTES, B({0x00, 0x00})},
 
     // -------------------------------------------------------------------------
     // dirsem, directive semantics: fill operands, .equ/.set constants,
@@ -613,6 +629,175 @@ int main() {
     }
     std::printf("  %d data-symbol-reference pass, %d fail\n", ds_pass, ds_fail);
 
+    // Resolution-path relocation encodings: every TriCore reloc form the
+    // library resolves in place is a faithful port of gas's md_apply_fix.
+    // Several are NON-LINEAR (the B-format 24-bit displacement is split across
+    // the word; 16OFF/LO2 permute the value; HI/HIADJ take the high half) and
+    // a dst_mask heuristic silently produced wrong bytes here.  Golden bytes
+    // captured against the in-place encoder; the symbol "S" resolves to the
+    // given absolute address via a LabelDefinition.
+    std::printf("\n--- resolution-path reloc encodings ---\n");
+    int rr_pass = 0, rr_fail = 0;
+    {
+        struct RR { const char* name; const char* src; uint64_t base; uint64_t sym;
+                    std::vector<uint8_t> want; };
+        const RR cases[] = {
+            // absB 24-bit absolute jump/call (24ABS, split B-format).  A naive
+            // contiguous-mask encoder produced `ja 0x10000000` for ja 0x10.
+            {"ja abs",        "ja S\n",            0,      0x10,       {0x9d,0x00,0x08,0x00}},
+            {"calla abs",     "calla S\n",         0,      0x10,       {0xed,0x00,0x08,0x00}},
+            // movh hi: == HIADJ (high half + 0x8000 carry adjust); lo: sign-
+            // extends, so movh hi:X / addi lo:X reconstructs X.
+            {"movh hiadj",    "movh %d0, hi:S\n",  0,      0x12345678, {0x7b,0x40,0x23,0x01}},
+            {"movh hiadj +1", "movh %d0, hi:S\n",  0,      0x0000abcd, {0x7b,0x10,0x00,0x00}},
+            {"mov.u lo",      "mov.u %d0, lo:S\n", 0,      0x12345678, {0xbb,0x80,0x67,0x05}},
+            // 18-bit absolute addressing (18ABS, non-contiguous split): used to
+            // fail loudly as "unsupported relocation".
+            {"lea abs",       "lea %a4, S\n",      0,      0x100,      {0xc5,0x04,0x00,0x40}},
+            {"ld.w abs",      "ld.w %d0, S\n",     0,      0x100,      {0x85,0x00,0x00,0x40}},
+            {"st.w abs",      "st.w S, %d0\n",     0,      0x100,      {0xa5,0x00,0x00,0x40}},
+            // PC-relative branches (24REL split, 15REL contiguous) for contrast.
+            {"j far 24REL",   "j S\n",             0x1000, 0x2000,     {0x1d,0x00,0x00,0x08}},
+            {"call 24REL",    "call S\n",          0x1000, 0x2000,     {0x6d,0x00,0x00,0x08}},
+            {"jeq 15REL",     "jeq %d0, 1, S\n",   0x1000, 0x1040,     {0xdf,0x10,0x04,0x80,0x1d,0x00,0x1e,0x00}},
+        };
+        for (const auto& c : cases) {
+            auto o = a.assemble(c.src, c.base, {{"S", c.sym}});
+            if (!o) { std::printf("  FAIL  [%s] %s\n", c.name, o.error().c_str()); ++rr_fail; continue; }
+            if (*o == c.want) ++rr_pass;
+            else { std::printf("  FAIL  [%s] got %s want %s\n", c.name, hex(*o).c_str(), hex(c.want).c_str()); ++rr_fail; }
+        }
+        // Semantic check: movh hi:X / addi lo:X must reconstruct X exactly
+        // (HIADJ + sign-extended LO).  Disassemble and confirm the operands.
+        auto recon = a.assemble("movh %d0, hi:S\n addi %d0, %d0, lo:S\n", 0, {{"S", 0xabcd}});
+        auto rd = recon ? a.disassemble_to_instructions(*recon, 0, 0)
+                        : tl::expected<std::vector<nyxstone::NyxstoneTricoreGCC::Instruction>, std::string>({});
+        if (recon && rd && rd->size() == 2
+            && (*rd)[0].assembly.find(",1") != std::string::npos          // movh 1
+            && (*rd)[1].assembly.find("-21555") != std::string::npos) ++rr_pass;  // addi 0xabcd sign-ext
+        else { std::printf("  FAIL  movh+addi reconstruction of 0xabcd\n"); ++rr_fail; }
+    }
+    std::printf("  %d resolution-reloc pass, %d fail\n", rr_pass, rr_fail);
+
+    // Relocation offset/addend correctness through relaxation, alignment, and
+    // interleaved data: each entry's offset must point at the placeholder.
+    std::printf("\n--- relocation offsets ---\n");
+    int ro_pass = 0, ro_fail = 0;
+    {
+        struct RO { const char* name; const char* src; size_t nrel;
+                    uint64_t off0; uint32_t type0; };
+        const RO cases[] = {
+            {"single j",          "j ext\n",                       1, 0x0, 3},
+            {"after 2-byte nop",  "nop\n j ext\n",                 1, 0x2, 3},
+            {"after .align(2^4)", "nop\n .align 4\n j ext\n",      1, 0x10, 3},
+            {"after .word data",  ".word 0x11223344\n j ext\n",    1, 0x4, 3},
+            {"after shrunk brnch","L: nop\n j L\n j ext\n",        1, 0x4, 3},
+            {"data reloc .word",  ".word ext\n",                   1, 0x0, 2},
+            {"two relocs",        "j a\n j b\n",                   2, 0x0, 3},
+        };
+        for (const auto& c : cases) {
+            auto r = a.assemble_with_relocs(c.src, 0x1000, {});
+            if (!r) { std::printf("  FAIL  [%s] %s\n", c.name, r.error().c_str()); ++ro_fail; continue; }
+            bool ok = r->relocations.size() == c.nrel
+                      && r->relocations[0].offset == c.off0
+                      && r->relocations[0].relocation_type == c.type0
+                      && r->relocations[0].offset < r->bytes.size();
+            if (c.nrel == 2 && ok)   // second reloc must follow the first insn
+                ok = r->relocations[1].offset == c.off0 + 4;
+            if (ok) ++ro_pass;
+            else { std::printf("  FAIL  [%s] nrel=%zu off0=0x%llx type0=%u\n", c.name,
+                               r->relocations.size(),
+                               r->relocations.empty()?0ull:(unsigned long long)r->relocations[0].offset,
+                               r->relocations.empty()?0u:r->relocations[0].relocation_type); ++ro_fail; }
+        }
+    }
+    std::printf("  %d reloc-offset pass, %d fail\n", ro_pass, ro_fail);
+
+    // Data fast-path (in-house emit_int_list) must byte-match gas's `cons` for
+    // the identical value: `.dir V` vs `.dir (V)+0` (the +0 forces the cons
+    // path).  Catches truncation / sign / base divergences in the fast path.
+    std::printf("\n--- data fast-path vs gas cons ---\n");
+    int fc_pass = 0, fc_fail = 0;
+    {
+        const char* dirs[] = {".byte", ".half", ".word", ".quad"};
+        const char* vals[] = {"0","1","-1","127","128","255","256","-128","-129",
+                              "32767","32768","65535","65536","-32768","-32769",
+                              "0x7fffffff","0xffffffff","0xdeadbeef","0b101","010","~0","(5<<4)"};
+        for (const char* d : dirs) for (const char* v : vals) {
+            std::string fast = std::string(d) + " " + v + "\n";
+            std::string cons = std::string(d) + " (" + v + ")+0\n";
+            auto rf = a.assemble(fast, 0, {});
+            auto rc = a.assemble(cons, 0, {});
+            if (rf && rc && *rf == *rc) ++fc_pass;
+            else { std::printf("  FAIL  [%s %s] fast=%s cons=%s\n", d, v,
+                               rf?hex(*rf).c_str():"err", rc?hex(*rc).c_str():"err"); ++fc_fail; }
+        }
+    }
+    std::printf("  %d data-fastpath pass, %d fail\n", fc_pass, fc_fail);
+
+    // Idempotence corpus: a curated spread of instruction formats (SR/SRR/SRC/
+    // SC/RR/RC/RLC/RCPW/BO/BOL/ABS/B/...) that must satisfy two invariants the
+    // round-trip fuzzer verified across the full 16-bit space and a 2.1M 32-bit
+    // sample: (1) the bytes disassemble to exactly this text, and (2) the text
+    // re-assembles and re-disassembles to the same text (assembler/disassembler
+    // agreement).  Guards against future drift in either direction.
+    std::printf("\n--- idempotence corpus ---\n");
+    int ic_pass = 0, ic_fail = 0;
+    {
+        struct IC { std::vector<uint8_t> bytes; const char* text; };
+        const IC corpus[] = {
+            {B({0x00,0x00}), "nop"},
+            {B({0x00,0x90}), "ret"},
+            {B({0x00,0x80}), "rfe"},
+            {B({0x00,0xa0}), "debug"},
+            {B({0x02,0x10}), "mov %d0,%d1"},
+            {B({0x82,0x54}), "mov %d4,5"},
+            {B({0x0b,0x21,0x00,0x00}), "add %d0,%d1,%d2"},
+            {B({0x0b,0x21,0x80,0x00}), "sub %d0,%d1,%d2"},
+            {B({0x0f,0x21,0x80,0x00}), "and %d0,%d1,%d2"},
+            {B({0x0f,0x65,0xa0,0x40}), "or %d4,%d5,%d6"},
+            {B({0x73,0x21,0x0a,0x00}), "mul %d0,%d1,%d2"},
+            {B({0x8f,0x41,0x00,0x00}), "sh %d0,%d1,4"},
+            {B({0xbb,0x40,0x23,0x01}), "mov.u %d0,4660"},
+            {B({0x7b,0x10,0x32,0x04}), "movh %d0,17185"},
+            {B({0x54,0x00}), "ld.w %d0,[%a0]"},
+            {B({0x19,0x21,0x04,0x00}), "ld.w %d1,[%a2]4"},
+            {B({0x74,0x34}), "st.w [%a3],%d4"},
+            {B({0x14,0x65}), "ld.bu %d5,[%a6]"},
+            {B({0x1b,0x41,0x06,0x00}), "addi %d0,%d1,100"},
+            {B({0x9b,0x11,0x00,0x00}), "addih %d0,%d1,1"},
+            {B({0xd9,0x10,0x08,0x00}), "lea %a0,[%a1]8"},
+            {B({0xdc,0x02}), "ji %a2"},
+            {B({0x26,0x10}), "and %d0,%d1"},
+            {B({0xc6,0x32}), "xor %d2,%d3"},
+            {B({0x0b,0x10,0xc0,0x01}), "abs %d0,%d1"},
+            {B({0x0b,0x21,0x80,0x01}), "min %d0,%d1,%d2"},
+            {B({0x60,0x10}), "mov.a %a0,%d1"},
+            {B({0x80,0x10}), "mov.d %d0,%a1"},
+            {B({0x37,0x01,0x48,0x02}), "extr %d0,%d1,4,8"},
+            {B({0x37,0x21,0x85,0x01}), "insert %d0,%d1,%d2,3,5"},
+            {B({0x03,0x54,0x6a,0x02}), "madd %e0,%e2,%d4,%d5"},
+            {B({0x34,0x01}), "st.b [%a0],%d1"},
+            {B({0x0b,0x21,0x70,0x02}), "or.eq %d0,%d1,%d2"},
+        };
+        const uint64_t cbase = 0x10000000;
+        for (const auto& c : corpus) {
+            auto d1 = a.disassemble_to_instructions(c.bytes, cbase, 1);
+            if (!d1 || d1->size() != 1) { std::printf("  FAIL  disasm [%s]\n", c.text); ++ic_fail; continue; }
+            std::string t1 = d1->front().assembly;
+            while (!t1.empty() && t1.back() == ' ') t1.pop_back();
+            if (t1 != c.text) { std::printf("  FAIL  disasm got [%s] want [%s]\n", t1.c_str(), c.text); ++ic_fail; continue; }
+            auto b2 = a.assemble(t1, cbase, {});
+            if (!b2) { std::printf("  FAIL  reasm [%s]: %s\n", c.text, b2.error().c_str()); ++ic_fail; continue; }
+            auto d2 = a.disassemble_to_instructions(*b2, cbase, 1);
+            std::string t2 = (d2 && d2->size() == 1) ? d2->front().assembly : "";
+            while (!t2.empty() && t2.back() == ' ') t2.pop_back();
+            if (t2 != c.text) { std::printf("  FAIL  not idempotent [%s] -> [%s]\n", c.text, t2.c_str()); ++ic_fail; continue; }
+            ++ic_pass;
+        }
+    }
+    std::printf("  %d idempotence-corpus pass, %d fail\n", ic_pass, ic_fail);
+
     // Error-message quality: failures must carry the gas diagnostic / the
     // offending symbol name, not a generic string (and nothing may leak to
     // the host stderr -- gas output is captured into the error channel).
@@ -664,13 +849,13 @@ int main() {
     std::printf("  %d address-masking pass, %d fail\n", am_pass, am_fail);
 
     int extra_fail = el_fail + ai_fail + dc_fail + wr_fail + air_fail + wri_fail + bd_fail + ds_fail
-                   + em_fail + am_fail;
+                   + em_fail + am_fail + rr_fail + ro_fail + fc_fail + ic_fail;
     std::printf("\nSummary: %d passed, %d failed, %d drifts (of %zu tests); "
                 "%d disasm round-trips passed, %d failed; "
                 "%d additional API checks passed, %d failed\n",
                 r.passed, r.failed, r.drift, TESTS.size(), rt_pass, rt_fail,
                 el_pass + ai_pass + dc_pass + wr_pass + air_pass + wri_pass + bd_pass + ds_pass
-                + em_pass + am_pass,
+                + em_pass + am_pass + rr_pass + ro_pass + fc_pass + ic_pass,
                 extra_fail);
     return (r.failed == 0 && r.drift == 0 && rt_fail == 0 && extra_fail == 0) ? 0 : 1;
 }

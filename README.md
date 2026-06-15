@@ -98,7 +98,7 @@ nopic+pic) on first run, no network access needed:
 # 1. Build the C++ library + tests + examples (~5 s on first run).
 make                    # or:  cmake -S . -B build && cmake --build build -j
 
-# 2. Run the test suite (155 + extra API tests).
+# 2. Run the test suite (162 + extra API tests).
 make test               # or:  ctest --test-dir build --output-on-failure
 
 # 3. Try an example.
@@ -336,7 +336,7 @@ NyxstoneTricoreGCC/
 │   ├── nyxstone.cpp               C++ implementation
 │   ├── nyxstone_glue.c            The only TU that touches gas internals
 │   └── nyxstone_c.cpp             C ABI wrapper
-├── tests/tests.cpp                155-test matrix + stress + round-trip + API checks
+├── tests/tests.cpp                162-test matrix + stress + round-trip + API checks
 ├── examples/{smoke,bench}.cpp     Demo and throughput benchmark
 ├── bindings/
 │   ├── rust/                      nyxstone-tricore-gcc (GPL) crate + nyxstone-tcd daemon
@@ -357,7 +357,7 @@ NyxstoneTricoreGCC/
 
 ## Tests
 
-`tests/tests.cpp` ships a 155-test matrix split into eleven groups:
+`tests/tests.cpp` ships a 162-test matrix split into twelve groups:
 
 - **insn** (47): every TriCore format we exercise (SR/SRR/SLR/SSR/SC/SRC/RC/
   RR/RLC/B), various register kinds, immediate widths, signedness.
@@ -374,8 +374,10 @@ NyxstoneTricoreGCC/
 - **forbid** (7+3): `.text`-only restriction, `.data` / `.bss` /
   `.section .foo` / `.pushsection` must all reject; `.text` / `.section
   .text*` must accept.
-- **quote** (5): `#` / `;` / `//` inside string literals survive the
-  tokenizer (`.asciz "a#b"` keeps its hash).
+- **quote** (6): `#` / `;` / `//` / `/* */` inside string literals survive
+  the tokenizer (`.asciz "a#b"` keeps its hash).
+- **comment** (6): `/* */` block comments, including mid-line, whole-line,
+  multi-line, and unterminated, are stripped like gas's input scrubber.
 - **dirsem** (13): `.skip`/`.space`/`.align` fill operands, `.align`
   max-skip, `.p2align`, `.equ`/`.set` constants and label expressions,
   numeric local labels (`1:` / `1b` / `1f`, including instance reuse).
@@ -387,20 +389,34 @@ NyxstoneTricoreGCC/
   out-of-range immediates -- all must reject instead of emitting silently
   wrong bytes.
 
-After the core matrix:
+After the core matrix, post-matrix checks (176 assertions) cover:
 
 - 100× stress per test catches state-reset drift across consecutive
   `assemble()` calls.
 - Every BYTES test of ≥2 bytes is round-tripped through
-  `disassemble_to_instructions()` (121 cases).
-- Additional checks cover `LabelDefinition` external symbols (exact
-  displacement bytes + address invariance), the `address` parameter
-  propagating to `Instruction.address`, the `count` parameter limiting
-  decoded instructions, relocation records, branch displacement semantics
-  (decoded target == label address), data directives referencing symbols,
-  error-message quality (gas diagnostics + offending symbol names must
-  appear in the returned error; nothing leaks to the host stderr), and
-  32-bit masking of printed branch targets.
+  `disassemble_to_instructions()` (128 cases).
+- `LabelDefinition` external symbols (exact displacement bytes + address
+  invariance), the `address` parameter propagating to `Instruction.address`,
+  the `count` parameter, relocation records, and branch displacement
+  semantics (decoded target == label address).
+- **Resolution-path relocation encodings**: every TriCore relocation the
+  library resolves in place is a faithful transcription of gas's
+  `md_apply_fix`, including the *non-linear* forms a naive mask heuristic
+  silently mis-encoded -- the split B-format 24-bit displacement (24REL/
+  24ABS), the carry-adjusted high half (HI/HIADJ, `movh hi:`), the permuted
+  16-bit offset (16OFF/LO2), and 18-bit absolute addressing (18ABS,
+  `lea`/`ld.w`/`st.w`).
+- **Relocation offsets** stay correct through relaxation, `.align`/`.org`
+  padding, and interleaved data.
+- The **data fast-path** (`emit_int_list`) is byte-checked against gas's
+  `cons` for every value (overflow, sign, all bases).
+- An **instruction idempotence corpus** (one per major format) pins both
+  the disassembler (bytes → text) and assembler/disassembler agreement
+  (text → bytes → text), the property the round-trip fuzzer verified across
+  the full 16-bit space and a 2.1M-case 32-bit sample.
+- Error-message quality (gas diagnostics + offending symbol names appear in
+  the returned error; nothing leaks to the host stderr) and 32-bit masking
+  of printed branch targets.
 
 The Rust crates run the same unit tests (verbatim sources, only the
 `use` line differs between `nyxstone-tricore-gcc` and `nyxstone-tricore-gcc-ipc`)
@@ -410,34 +426,23 @@ protocol frame caps).
 
 ```
 $ ./run_tests
-... (155 tests in 11 groups) ...
+... (162 tests in 12 groups) ...
 --- 100x stress (each non-MUST_FAIL test 100 iterations) ---
-  PASS: no drift across 135 non-fail tests * 100 iterations
+  PASS: no drift across 142 non-fail tests * 100 iterations
 --- disassembly round-trip ---
-  121 round-trip pass, 0 fail
---- external label resolution ---
-  3 external-label pass, 0 fail
---- assemble_to_instructions address ---
-  1 assemble_to_instructions pass, 0 fail
---- disassemble count ---
-  2 disassemble count pass, 0 fail
---- assemble_with_relocs ---
-  4 assemble_with_relocs pass, 0 fail
---- assemble_to_instructions_with_relocs ---
-  2 assemble_to_instructions_with_relocs pass, 0 fail
---- with_relocs ignores internal labels ---
-  1 internal-label pass, 0 fail
---- branch displacement (relative references) ---
-  10 branch-displacement pass, 0 fail
---- data symbol references ---
-  5 data-symbol-reference pass, 0 fail
---- error message quality ---
-  7 error-message pass, 0 fail
---- disassembly address masking ---
-  1 address-masking pass, 0 fail
-Summary: 155 passed, 0 failed, 0 drifts (of 155 tests);
-         121 disasm round-trips passed, 0 failed;
-         36 additional API checks passed, 0 failed
+  128 round-trip pass, 0 fail
+--- resolution-path reloc encodings ---
+  12 resolution-reloc pass, 0 fail
+--- relocation offsets ---
+  7 reloc-offset pass, 0 fail
+--- data fast-path vs gas cons ---
+  88 data-fastpath pass, 0 fail
+--- idempotence corpus ---
+  33 idempotence-corpus pass, 0 fail
+  ... (external-label, relocs, branch, error-message, masking checks) ...
+Summary: 162 passed, 0 failed, 0 drifts (of 162 tests);
+         128 disasm round-trips passed, 0 failed;
+         176 additional API checks passed, 0 failed
 ```
 
 ## Threading
