@@ -1,6 +1,6 @@
 [package]
 name          = "nyxstone-tricore-gcc"
-version       = "0.1.2"
+version       = "0.2.0"
 edition       = "2021"
 rust-version  = "1.70"
 authors       = ["emproof"]
@@ -34,7 +34,7 @@ name = "nyxstone_tricore_gcc"
 path = "src/lib.rs"
 
 [dependencies]
-nyxstone-tricore-gcc-ipc = { version = "0.1.2", path = "../rust-ipc", default-features = false }
+nyxstone-tricore-gcc-ipc = { version = "0.2.0", path = "../rust-ipc", default-features = false }
 libc = "0.2"
 
 [build-dependencies]

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "nyxstone-tricore-gcc"
-version         = "0.1.2"
+version         = "0.2.0"
 description     = "In-process TriCore assembler/disassembler, Python bindings around binutils-tricore (gas + libopcodes)."
 readme          = "README.md"
 license         = "GPL-3.0-or-later"

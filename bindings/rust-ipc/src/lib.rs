@@ -6,10 +6,10 @@
 //!
 //! ```toml
 //! # max performance, GPL-3.0+:
-//! nyxstone-tricore-gcc     = "0.1"
+//! nyxstone-tricore-gcc     = "0.2"
 //!
 //! # commercially permissive, ~150 k ops/s via IPC:
-//! nyxstone-tricore-gcc-ipc = "0.1"
+//! nyxstone-tricore-gcc-ipc = "0.2"
 //! ```
 //!
 //! User code stays the same, same struct, same methods, same types.

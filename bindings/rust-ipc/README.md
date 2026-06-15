@@ -10,10 +10,10 @@ switch between modes by changing **one line** in your `Cargo.toml`:
 
 ```toml
 # max performance, in-process (GPL-3.0-or-later):
-nyxstone-tricore-gcc     = "0.1"
+nyxstone-tricore-gcc     = "0.2"
 
 # permissive license, IPC mode (MIT):
-nyxstone-tricore-gcc-ipc = "0.1"
+nyxstone-tricore-gcc-ipc = "0.2"
 ```
 
 User code stays the same.
