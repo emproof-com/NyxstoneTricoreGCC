@@ -600,7 +600,11 @@ tl::expected<AssembleCore, std::string> do_assemble(
             result.relocations.reserve(count);
             for (const auto& r : raw) {
                 RelocationInfo ri;
-                ri.offset          = r.offset;
+                // Offset is the absolute address of the relocation site
+                // (assemble base + section-relative offset), matching the
+                // absolute `Instruction.address` field and the sibling
+                // Nyxstone API; the linker patches that location in memory.
+                ri.offset          = address + r.offset;
                 if (r.has_addend) ri.addend = r.addend;
                 ri.relocation_type = r.reloc_type;
                 ri.symbol.name     = r.symbol_name ? r.symbol_name : "";

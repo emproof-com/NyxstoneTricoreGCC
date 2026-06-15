@@ -11,7 +11,7 @@
 
 cmake_minimum_required(VERSION 3.16)
 project(nyxstone_tricore
-    VERSION 0.2.0
+    VERSION 0.2.1
     DESCRIPTION "In-process TriCore assembler/disassembler built on EEESlab tricore-binutils-gdb"
     LANGUAGES C CXX)
 
@@ -117,6 +117,12 @@ if(NYX_BUILD_TESTS)
     add_executable(run_tests tests/tests.cpp)
     target_link_libraries(run_tests PRIVATE nyxstone_tricore)
     add_test(NAME tests COMMAND run_tests)
+
+    # Exhaustive v1.6.2 round-trip + reference-resolution test.  Includes the
+    # generated corpus tests/tricore_v162_insns.inc relative to the source.
+    add_executable(roundtrip_all tests/roundtrip_all.cpp)
+    target_link_libraries(roundtrip_all PRIVATE nyxstone_tricore)
+    add_test(NAME roundtrip_all COMMAND roundtrip_all)
 endif()
 
 # ---- install ------------------------------------------------------------

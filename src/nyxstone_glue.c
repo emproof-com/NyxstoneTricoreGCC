@@ -45,6 +45,7 @@ extern void     symbol_begin (void);
 #include <inttypes.h>
 
 extern void md_begin (void);
+extern int  md_parse_option (int c, const char *arg);
 extern void md_assemble (char *);
 extern void md_apply_fix (fixS *, valueT *, segT);
 extern long md_pcrel_from_section (fixS *, segT);
@@ -182,6 +183,15 @@ int nyxstone_glue_init_once (void)
     expr_section = subseg_new ("*expr*", 0);
 
     subseg_set (text_section, 0);
+
+    /* Select the instruction set BEFORE md_begin: tc-tricore.c defaults
+       current_isa to TRICORE_V1_2, which filters out every v1.6+ opcode
+       (fret, fcall, cmpswap.w, ...) at assemble time and would also seed the
+       wrong mach / branch-opcode arch vars in md_begin.  The disassembler
+       runs at EF_EABI_TRICORE_V1_6_2 (mach 0x00100000, see
+       nyxstone_glue_disasm_one), so assemble at the matching v1.6.2 level to
+       keep the two symmetric.  This mirrors `tricore-elf-as -mtc162`. */
+    md_parse_option ('m', "tc162");
 
     md_begin ();   /* populates hash_ops / hash_sfr / pseudo_codes */
 
@@ -1031,6 +1041,30 @@ static void dis_print_address (bfd_vma addr, struct disassemble_info *info) {
    success, *text_out points to a freshly malloc'd null-terminated string
    (caller frees).  The bytes_out parameter is ignored, caller already has
    the bytes; we just consume `n` of them. */
+/* Strip the disassembler's " <0x...>" symbolic-address annotation in place.
+
+   print_insn_tricore tracks a `movh.a %aN, hi` followed by a `lea`/`ld.`/
+   `st.`/`swap`/`ldmst` on the same base register and, like objdump, appends
+   the reconstructed absolute address as a comment, e.g.
+   "lea %a0,[%a0]-8531 <0xdead>".  The address is informational only -- the
+   real operand is the decimal offset -- and the " <...>" suffix is not valid
+   assembler input, so it breaks anyone re-assembling our disassembly.  No
+   legitimate TriCore operand contains '<', so removing every " <...>" run is
+   safe; branch/call targets are printed without angle brackets and are kept. */
+static void strip_addr_annotation (char *s)
+{
+    char *w = s;
+    for (char *r = s; *r; ) {
+        if (r[0] == ' ' && r[1] == '<') {
+            const char *p = r + 2;
+            while (*p && *p != '>') ++p;
+            if (*p == '>') { r = (char *) p + 1; continue; }  /* drop " <...>" */
+        }
+        *w++ = *r++;
+    }
+    *w = '\0';
+}
+
 int nyxstone_glue_disasm_one (const uint8_t *bytes, size_t len, uint64_t addr,
                          char **text_out, size_t *n_consumed)
 {
@@ -1058,6 +1092,7 @@ int nyxstone_glue_disasm_one (const uint8_t *bytes, size_t len, uint64_t addr,
         free (ctx.buf);
         return n;
     }
+    if (ctx.buf) strip_addr_annotation (ctx.buf);
     *text_out = ctx.buf ? ctx.buf : strdup ("");
     *n_consumed = (size_t) n;
     return n;

@@ -184,7 +184,10 @@ public:
     ///
     /// Undecodable input degrades to objdump-style `.byte`/`.hword` lines.
     /// Branch/call targets are printed masked to 32 bits (TriCore's address
-    /// width), matching objdump.
+    /// width), matching objdump.  The output is kept re-assemblable: the
+    /// objdump-style ` <0x..>` symbolic-address comment that libopcodes
+    /// appends after a `movh.a`+`lea`/`ld`/`st` address-reconstruction
+    /// sequence is stripped.
     ///
     /// @param bytes   The byte code to be disassembled.
     /// @param address The absolute address of the first byte.

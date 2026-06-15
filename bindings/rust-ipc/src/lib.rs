@@ -404,6 +404,20 @@ mod tests {
     }
 
     #[test]
+    fn v16_isa_and_disasm_annotation() {
+        let nx = NyxstoneTricoreGCC::new().unwrap();
+        assert_eq!(nx.assemble("fret\n", 0, &[]).unwrap(), vec![0x00, 0x70]);
+        assert_eq!(nx.assemble("cmpswap.w [%a0+]4, %e0\n", 0x10000, &[]).unwrap(),
+                   vec![0x49, 0x00, 0xc4, 0x00]);
+        assert!(nx.assemble("fcall L\nL: nop\n", 0x10002, &[]).is_ok());
+        let b = nx.assemble("movh.a %a0, hi:L\n lea %a0, [%a0]lo:L\n", 0,
+                            &[LabelDefinition::new("L", 0x70001234)]).unwrap();
+        for ins in nx.disassemble_to_instructions(&b, 0, 0).unwrap() {
+            assert!(!ins.assembly.contains('<'), "annotation leaked: {:?}", ins.assembly);
+        }
+    }
+
+    #[test]
     fn branch_displacements_resolve() {
         let nx = NyxstoneTricoreGCC::new().unwrap();
         // Forward branch over several instructions must target the label, not
@@ -474,7 +488,8 @@ mod tests {
         assert_eq!(&bytes[..], &[0x00, 0x00, 0x1d, 0x00, 0x00, 0x00]);
         assert_eq!(relocs.len(), 1);
         let r = &relocs[0];
-        assert_eq!(r.offset, 0x2);
+        // offset is absolute: base 0x1000 + 2-byte nop.
+        assert_eq!(r.offset, 0x1002);
         assert_eq!(r.symbol.name, "ext");
         assert_eq!(r.symbol.address, 0x2000);
         // R_TRICORE_24REL == 3
@@ -504,7 +519,23 @@ mod tests {
         assert_eq!(insns[0].address, 0x1000);
         assert_eq!(insns[1].address, 0x1002);
         assert_eq!(relocs.len(), 1);
-        assert_eq!(relocs[0].offset, 0x2);
+        assert_eq!(relocs[0].offset, 0x1002);          // absolute
+        assert_eq!(relocs[0].symbol.address, 0x9000);  // hint from LabelDefinition
+    }
+
+    #[test]
+    fn reloc_offset_is_absolute_and_address_hint_resolves() {
+        // Regression: absolute reloc offset + symbol.address hint must survive
+        // the IPC round-trip (the daemon serializes sym_addr in the protocol),
+        // including a leading-dot label name.
+        let nx = NyxstoneTricoreGCC::new().unwrap();
+        let (_, relocs) = nx.assemble_with_relocs(
+            "j .lbl\n", 0x10002, &[LabelDefinition::new(".lbl", 0x101010)]).unwrap();
+        assert_eq!(relocs.len(), 1);
+        assert_eq!(relocs[0].offset, 0x10002);
+        assert_eq!(relocs[0].symbol.name, ".lbl");
+        assert_eq!(relocs[0].symbol.address, 0x101010);
+        assert_eq!(relocs[0].relocation_type, 3);
     }
 
     #[test]

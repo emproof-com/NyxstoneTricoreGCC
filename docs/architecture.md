@@ -165,7 +165,9 @@ How this differs from plain `assemble`:
 | reloc collection | n/a | walks `text_section`'s `frchain.fix_root`, emits one entry per `fx_done==0 && fx_addsy` |
 
 For each unresolved fix the glue produces:
-- `offset = fx_frag->fr_address + fx_where` (section-relative)
+- `offset = fx_frag->fr_address + fx_where` (section-relative); the C++ layer
+  adds the assemble `address` so the public `RelocationInfo.offset` is the
+  **absolute** address of the reloc site (matching `Instruction.address`)
 - `addend = fx_addnumber` (gas's RELA-style addend, set by md_apply_fix)
 - `relocation_type = bfd_reloc_type_lookup(stdoutput, fx_r_type)->type`
   (the ELF `R_TRICORE_*` value, e.g. 3 for `R_TRICORE_24REL`)

@@ -66,7 +66,7 @@ SYSTEM_LIBS   := -lz -lzstd -ldl -lm -lstdc++
 
 .PHONY: all clean test bench smoke prebuilt fetch_binutils
 
-all: libnyxstone_tricore.a smoke bench run_tests
+all: libnyxstone_tricore.a smoke bench run_tests roundtrip_all
 
 # Explicit re-provision targets (override the cached state).
 prebuilt:
@@ -108,8 +108,15 @@ run_tests: tests/tests.cpp libnyxstone_tricore.a
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< \
 	  libnyxstone_tricore.a $(GAS_OBJS) $(BINUTILS_LIBS) $(SYSTEM_LIBS) -o $@
 
-test: run_tests
+# Exhaustive v1.6.2 round-trip + reference-resolution test (every instruction
+# from the binutils opcode table; see tests/roundtrip_all.cpp).
+roundtrip_all: tests/roundtrip_all.cpp tests/tricore_v162_insns.inc libnyxstone_tricore.a
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< \
+	  libnyxstone_tricore.a $(GAS_OBJS) $(BINUTILS_LIBS) $(SYSTEM_LIBS) -o $@
+
+test: run_tests roundtrip_all
 	./run_tests
+	./roundtrip_all
 
 clean:
-	rm -f *.o *.a *.so smoke bench run_tests
+	rm -f *.o *.a *.so smoke bench run_tests roundtrip_all

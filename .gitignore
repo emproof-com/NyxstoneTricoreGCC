@@ -17,6 +17,7 @@ third_party/binutils-tricore/
 /smoke
 /bench
 /run_tests
+/roundtrip_all
 
 # Rust.
 bindings/rust/target/

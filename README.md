@@ -253,8 +253,9 @@ let bytes2 = nx.assemble("nop; nop; j ext", 0x1000,
 let (rel_bytes, relocs) = nx.assemble_with_relocs(
     "nop\n j ext\n", 0x1000,
     &[LabelDefinition::new("ext", 0x2000)])?;
-// relocs[0] = { offset: 2, symbol: { name: "ext", address: 0x2000 },
+// relocs[0] = { offset: 0x1002, symbol: { name: "ext", address: 0x2000 },
 //               relocation_type: 3 /* R_TRICORE_24REL */, addend: Some(0) }
+// offset is the absolute address of the reloc site: base 0x1000 + 2-byte nop.
 ```
 
 The MIT crate additionally exposes three bootstrap helpers for daemon
@@ -292,7 +293,7 @@ rel_bytes, relocs = nx.assemble_with_relocs(
     "nop\n j ext\n",
     address=0x1000,
     labels=[LabelDefinition("ext", 0x2000)])
-# relocs[0] == RelocationInfo(offset=2, addend=0,
+# relocs[0] == RelocationInfo(offset=0x1002, addend=0,   # absolute: base + nop
 #                             symbol=RelocationSymbol(name="ext", address=0x2000),
 #                             relocation_type=3)  # R_TRICORE_24REL
 ```
@@ -389,7 +390,7 @@ NyxstoneTricoreGCC/
   out-of-range immediates -- all must reject instead of emitting silently
   wrong bytes.
 
-After the core matrix, post-matrix checks (176 assertions) cover:
+After the core matrix, post-matrix checks (194 assertions) cover:
 
 - 100× stress per test catches state-reset drift across consecutive
   `assemble()` calls.
@@ -406,8 +407,15 @@ After the core matrix, post-matrix checks (176 assertions) cover:
   24ABS), the carry-adjusted high half (HI/HIADJ, `movh hi:`), the permuted
   16-bit offset (16OFF/LO2), and 18-bit absolute addressing (18ABS,
   `lea`/`ld.w`/`st.w`).
-- **Relocation offsets** stay correct through relaxation, `.align`/`.org`
-  padding, and interleaved data.
+- **Relocation offsets** are absolute (base + section position) and stay
+  correct through relaxation, `.align`/`.org` padding, and interleaved data;
+  the `symbol.address` hint resolves through every binding.
+- **ISA level**: the assembler accepts the v1.6/1.6.2 instruction set the
+  disassembler decodes (`fret`, `fcall`, `cmpswap.w`, ...) -- gas's default
+  v1.2 silently rejected them.
+- **Disassembly is re-assemblable**: the objdump-style ` <0x..>` symbolic-
+  address annotation (after a `movh.a`+`lea`/`ld`/`st` sequence) is stripped,
+  and load/store/lea references to labels resolve to the right address.
 - The **data fast-path** (`emit_int_list`) is byte-checked against gas's
   `cons` for every value (overflow, sign, all bases).
 - An **instruction idempotence corpus** (one per major format) pins both
@@ -417,6 +425,31 @@ After the core matrix, post-matrix checks (176 assertions) cover:
 - Error-message quality (gas diagnostics + offending symbol names appear in
   the returned error; nothing leaks to the host stderr) and 32-bit masking
   of printed branch targets.
+
+A separate `roundtrip_all` test (also run by `make test`) is exhaustive over
+the **whole v1.6.2 instruction set**: it drives all 398 instruction/format
+entries from the pinned binutils opcode table (extracted by
+[`scripts/gen_v162_corpus.py`](scripts/gen_v162_corpus.py) into
+[`tests/tricore_v162_insns.inc`](tests/tricore_v162_insns.inc)), synthesizing
+operands from each instruction's arg-spec across two parameter variants (low
+registers + mid immediates, and high registers + extreme immediates).  Every
+instruction must assemble in both variants; every non-branch form must
+round-trip idempotently (`disassemble → assemble → disassemble` stable); and
+every branch/absolute/symbol operand must resolve both inline (label address
+recovered in the disassembly) and as a relocation (`assemble_with_relocs`
+yields the right symbol, absolute offset, and address). PC-relative branches
+are validated only via the reference path, since the disassembler prints an
+absolute target that gas re-reads as a displacement (upstream convention).
+
+```
+=== TriCore v1.6.2 exhaustive round-trip ===
+instruction/format entries:  398
+assembled (variant A):       398  (100.0%)
+assembled (variant B):       398  (high regs / extreme immediates)
+round-trip idempotent:       375 / 375 checked (non-branch)
+reference/reloc resolved:    25 / 25
+OK
+```
 
 The Rust crates run the same unit tests (verbatim sources, only the
 `use` line differs between `nyxstone-tricore-gcc` and `nyxstone-tricore-gcc-ipc`)
@@ -439,10 +472,12 @@ $ ./run_tests
   88 data-fastpath pass, 0 fail
 --- idempotence corpus ---
   33 idempotence-corpus pass, 0 fail
+--- v1.6 instruction set / annotation strip / load-store label resolution ---
+  5 v1.6-isa, 4 annotation-strip, 9 load-store-label pass, 0 fail
   ... (external-label, relocs, branch, error-message, masking checks) ...
 Summary: 162 passed, 0 failed, 0 drifts (of 162 tests);
          128 disasm round-trips passed, 0 failed;
-         176 additional API checks passed, 0 failed
+         194 additional API checks passed, 0 failed
 ```
 
 ## Threading

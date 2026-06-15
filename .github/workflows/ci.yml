@@ -36,6 +36,10 @@ jobs:
       - name: Python smoke
         working-directory: bindings/python
         run: |
-          python3 -m pip install --quiet cffi
+          # setuptools>=77 is required for the PEP 639 SPDX `license` field in
+          # pyproject.toml (matches [build-system].requires); the runner's
+          # system setuptools is older and rejects the string form.  `setup.py
+          # build_ext` bypasses build isolation, so upgrade it explicitly.
+          python3 -m pip install --quiet --upgrade "setuptools>=77" cffi
           python3 setup.py build_ext --inplace
           PYTHONPATH=. python3 examples/smoke.py

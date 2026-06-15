@@ -495,7 +495,8 @@ int main() {
                 ++wr_fail;
             } else {
                 const auto& rl = r->relocations[0];
-                if (rl.offset != 0x2 || rl.symbol.name != "ext"
+                // offset is absolute: base 0x1000 + 2-byte nop = 0x1002.
+                if (rl.offset != 0x1002 || rl.symbol.name != "ext"
                     || rl.symbol.address != 0x2000
                     || rl.relocation_type != 3 /* R_TRICORE_24REL */) {
                     std::printf("  FAIL  reloc fields: off=%lx name=%s addr=%lx type=%u\n",
@@ -536,7 +537,7 @@ int main() {
                 || r->instructions[1].address != 0x1002) {
                 std::printf("  FAIL  instructions\n"); ++air_fail;
             } else ++air_pass;
-            if (r->relocations.size() != 1 || r->relocations[0].offset != 0x2
+            if (r->relocations.size() != 1 || r->relocations[0].offset != 0x1002
                 || r->relocations[0].symbol.address != 0x9000) {
                 std::printf("  FAIL  relocations\n"); ++air_fail;
             } else ++air_pass;
@@ -684,16 +685,17 @@ int main() {
     std::printf("\n--- relocation offsets ---\n");
     int ro_pass = 0, ro_fail = 0;
     {
+        // Offsets are absolute (base 0x1000 + section-relative position).
         struct RO { const char* name; const char* src; size_t nrel;
                     uint64_t off0; uint32_t type0; };
         const RO cases[] = {
-            {"single j",          "j ext\n",                       1, 0x0, 3},
-            {"after 2-byte nop",  "nop\n j ext\n",                 1, 0x2, 3},
-            {"after .align(2^4)", "nop\n .align 4\n j ext\n",      1, 0x10, 3},
-            {"after .word data",  ".word 0x11223344\n j ext\n",    1, 0x4, 3},
-            {"after shrunk brnch","L: nop\n j L\n j ext\n",        1, 0x4, 3},
-            {"data reloc .word",  ".word ext\n",                   1, 0x0, 2},
-            {"two relocs",        "j a\n j b\n",                   2, 0x0, 3},
+            {"single j",          "j ext\n",                       1, 0x1000, 3},
+            {"after 2-byte nop",  "nop\n j ext\n",                 1, 0x1002, 3},
+            {"after .align(2^4)", "nop\n .align 4\n j ext\n",      1, 0x1010, 3},
+            {"after .word data",  ".word 0x11223344\n j ext\n",    1, 0x1004, 3},
+            {"after shrunk brnch","L: nop\n j L\n j ext\n",        1, 0x1004, 3},
+            {"data reloc .word",  ".word ext\n",                   1, 0x1000, 2},
+            {"two relocs",        "j a\n j b\n",                   2, 0x1000, 3},
         };
         for (const auto& c : cases) {
             auto r = a.assemble_with_relocs(c.src, 0x1000, {});
@@ -701,7 +703,9 @@ int main() {
             bool ok = r->relocations.size() == c.nrel
                       && r->relocations[0].offset == c.off0
                       && r->relocations[0].relocation_type == c.type0
-                      && r->relocations[0].offset < r->bytes.size();
+                      // absolute offset must land inside [base, base+bytes).
+                      && r->relocations[0].offset >= 0x1000
+                      && r->relocations[0].offset - 0x1000 < r->bytes.size();
             if (c.nrel == 2 && ok)   // second reloc must follow the first insn
                 ok = r->relocations[1].offset == c.off0 + 4;
             if (ok) ++ro_pass;
@@ -798,6 +802,100 @@ int main() {
     }
     std::printf("  %d idempotence-corpus pass, %d fail\n", ic_pass, ic_fail);
 
+    // ISA level: the assembler must accept the v1.6/1.6.2 instruction set, the
+    // same level the disassembler decodes (mach 0x00100000).  gas defaults
+    // current_isa to v1.2, which silently filtered these out; we select
+    // tc162 in init.  Golden bytes pin the encodings.
+    std::printf("\n--- v1.6 instruction set ---\n");
+    int isa_pass = 0, isa_fail = 0;
+    {
+        struct II { const char* src; uint64_t base; std::vector<uint8_t> want; };
+        const II cases[] = {
+            {"fret\n",                     0,       B({0x00,0x70})},
+            {"fcall L\nL: nop\n",          0x10002, B({0x61,0x00,0x02,0x00,0x00,0x00})},
+            {"cmpswap.w [%a0+]4, %e0\n",   0x10000, B({0x49,0x00,0xc4,0x00})},
+            {"swapmsk.w [%a0+]4, %e0\n",   0,       {}},   // bytes unchecked; must assemble
+            {"crc32 %d0, %d1, %d2\n",      0,       {}},
+        };
+        for (const auto& c : cases) {
+            auto o = a.assemble(c.src, c.base, {});
+            if (!o) { std::printf("  FAIL  [%s] %s\n", c.src, o.error().c_str()); ++isa_fail; continue; }
+            if (!c.want.empty() && *o != c.want) {
+                std::printf("  FAIL  [%s] got %s\n", c.src, hex(*o).c_str()); ++isa_fail;
+            } else ++isa_pass;
+        }
+    }
+    std::printf("  %d v1.6-isa pass, %d fail\n", isa_pass, isa_fail);
+
+    // Disassembly must NOT contain the objdump-style " <0x...>" symbolic-address
+    // annotation that print_insn_tricore appends after a movh.a + lea/ld/st
+    // address-reconstruction sequence -- it is not valid assembler input and
+    // breaks anyone re-assembling our output.  Assemble the trigger sequence,
+    // disassemble, and require the second instruction carry no '<'.
+    std::printf("\n--- disasm annotation stripped ---\n");
+    int an_pass = 0, an_fail = 0;
+    {
+        const char* triggers[] = {
+            "movh.a %a0, hi:L\n lea %a0, [%a0]lo:L\n",
+            "movh.a %a2, hi:L\n ld.w %d0, [%a2]lo:L\n",
+            "movh.a %a4, hi:L\n st.w [%a4]lo:L, %d0\n",
+        };
+        for (const char* src : triggers) {
+            auto o = a.assemble(src, 0, {{"L", 0x70001234}});
+            if (!o) { std::printf("  FAIL  [%s] %s\n", src, o.error().c_str()); ++an_fail; continue; }
+            auto ins = a.disassemble_to_instructions(*o, 0, 0);
+            bool clean = ins.has_value();
+            if (clean) for (const auto& i : *ins)
+                if (i.assembly.find('<') != std::string::npos) clean = false;
+            if (clean) ++an_pass;
+            else { std::printf("  FAIL  [%s] annotation present\n", src); ++an_fail; }
+        }
+        // The reconstruction itself must still be correct (movh.a hiadj + lea lo
+        // rebuild L): the lea offset is lo(L) = 0x1234 = 4660.
+        auto o = a.assemble("movh.a %a0, hi:L\n lea %a0, [%a0]lo:L\n", 0, {{"L", 0x70001234}});
+        auto ins = o ? a.disassemble_to_instructions(*o, 0, 0)
+                     : tl::expected<std::vector<nyxstone::NyxstoneTricoreGCC::Instruction>, std::string>({});
+        if (o && ins && ins->size() == 2
+            && (*ins)[1].assembly.find("4660") != std::string::npos) ++an_pass;
+        else { std::printf("  FAIL  reconstruction offset wrong\n"); ++an_fail; }
+    }
+    std::printf("  %d annotation-strip pass, %d fail\n", an_pass, an_fail);
+
+    // Load/store referencing a label must resolve to the label's address.
+    // 18-bit absolute addressing (ld/st/lea X) encodes low bits of X; the
+    // movh.a/lea materialization rebuilds the full 32-bit address.  Verified
+    // by disassembling and checking the recovered absolute address / offset.
+    std::printf("\n--- load/store label resolution ---\n");
+    int ls_pass = 0, ls_fail = 0;
+    {
+        struct LS { const char* src; uint64_t laddr; const char* want; };
+        const LS cases[] = {
+            {"ld.w %d0, L\n",  0x100, "0x100"},
+            {"ld.b %d0, L\n",  0x200, "0x200"},
+            {"ld.h %d0, L\n",  0x3c,  "0x3c"},
+            {"ld.a %a0, L\n",  0x100, "0x100"},
+            {"st.w L, %d0\n",  0x100, "0x100"},
+            {"st.b L, %d0\n",  0x40,  "0x40"},
+            {"st.a L, %a0\n",  0x100, "0x100"},
+            {"lea %a0, L\n",   0x100, "0x100"},
+        };
+        for (const auto& c : cases) {
+            auto o = a.assemble(c.src, 0, {{"L", c.laddr}});
+            if (!o) { std::printf("  FAIL  [%s] %s\n", c.src, o.error().c_str()); ++ls_fail; continue; }
+            auto d = a.disassemble(*o, 0, 0);
+            if (d && d->find(c.want) != std::string::npos) ++ls_pass;
+            else { std::printf("  FAIL  [%s] got %s want %s\n", c.src, d?d->c_str():"err", c.want); ++ls_fail; }
+        }
+        // reloc path: ld.w to undefined label -> 18ABS reloc (type 9), absolute
+        // offset, address hint from the LabelDefinition.
+        auto r = a.assemble_with_relocs("ld.w %d0, L\n", 0x10000, {{"L", 0x100}});
+        if (r && r->relocations.size() == 1
+            && r->relocations[0].offset == 0x10000
+            && r->relocations[0].symbol.address == 0x100) ++ls_pass;
+        else { std::printf("  FAIL  ld.w label reloc\n"); ++ls_fail; }
+    }
+    std::printf("  %d load-store-label pass, %d fail\n", ls_pass, ls_fail);
+
     // Error-message quality: failures must carry the gas diagnostic / the
     // offending symbol name, not a generic string (and nothing may leak to
     // the host stderr -- gas output is captured into the error channel).
@@ -849,13 +947,13 @@ int main() {
     std::printf("  %d address-masking pass, %d fail\n", am_pass, am_fail);
 
     int extra_fail = el_fail + ai_fail + dc_fail + wr_fail + air_fail + wri_fail + bd_fail + ds_fail
-                   + em_fail + am_fail + rr_fail + ro_fail + fc_fail + ic_fail;
+                   + em_fail + am_fail + rr_fail + ro_fail + fc_fail + ic_fail + isa_fail + an_fail + ls_fail;
     std::printf("\nSummary: %d passed, %d failed, %d drifts (of %zu tests); "
                 "%d disasm round-trips passed, %d failed; "
                 "%d additional API checks passed, %d failed\n",
                 r.passed, r.failed, r.drift, TESTS.size(), rt_pass, rt_fail,
                 el_pass + ai_pass + dc_pass + wr_pass + air_pass + wri_pass + bd_pass + ds_pass
-                + em_pass + am_pass + rr_pass + ro_pass + fc_pass + ic_pass,
+                + em_pass + am_pass + rr_pass + ro_pass + fc_pass + ic_pass + isa_pass + an_pass + ls_pass,
                 extra_fail);
     return (r.failed == 0 && r.drift == 0 && rt_fail == 0 && extra_fail == 0) ? 0 : 1;
 }
