@@ -115,8 +115,9 @@ pub(crate) fn install_required_message() -> String {
 }
 
 /// Install the daemon binary by invoking `cargo install`, preferring
-/// `cargo binstall` (fetches a pre-built binary, much faster) when available
-/// on PATH.  Returns the resolved daemon path on success.
+/// `cargo binstall` when it is on PATH (it takes a prebuilt daemon from a
+/// GitHub release when one exists for the version, else it builds from
+/// source).  Returns the resolved daemon path on success.
 ///
 /// The install is PINNED to this crate's exact version so the daemon's wire
 /// protocol always matches the client -- an unpinned `cargo install` would

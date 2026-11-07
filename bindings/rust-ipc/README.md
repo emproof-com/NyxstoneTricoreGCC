@@ -83,7 +83,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 It is idempotent (no-op if the daemon is already locatable), prefers
-`cargo binstall` when present, and pins the install to this crate's exact
+`cargo binstall` when present (no release binaries exist yet, so it builds
+from source like `cargo install`), and pins the install to this crate's exact
 version.  There's also `install_daemon()` (force-reinstall) and `daemon_path()`
 (locate-only, no install).
 
