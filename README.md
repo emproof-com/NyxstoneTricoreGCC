@@ -79,10 +79,12 @@ talks to it over a `socketpair(2)` UNIX socket, one daemon per
 `NyxstoneTricoreGCC` instance, lazy-spawn, exiting when the instance is
 dropped or the parent dies (socket EOF; deliberately not `PR_SET_PDEATHSIG`,
 which is thread-scoped).  Strict FIFO, 30 s request timeouts, automatic
-one-shot daemon respawn if it crashes mid-session.  See
-[`bindings/rust-ipc/README.md`](bindings/rust-ipc/README.md) for the binary
-dependency and three daemon-install methods (`cargo install`, `cargo
-binstall`, programmatic bootstrap).
+one-shot daemon respawn if it crashes mid-session.  `new()` only *locates* the
+daemon (next to your executable, on `PATH`, or via `NYXSTONE_TCD_PATH`) and
+never installs it — **deployed/containerized builds should ship the matching
+`nyxstone-tcd` alongside their binary**, not `cargo install` it at runtime.
+See [`bindings/rust-ipc/README.md`](bindings/rust-ipc/README.md) for
+deployment, the optional dev-only auto-install, and the daemon lifecycle.
 
 The C++ and Python bindings only ship in GPL form today, they statically
 link gas in-process for full speed.  If you need permissive licensing for

@@ -30,6 +30,12 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+/// The exact crate spec `cargo install` / `cargo binstall` targets.  Pinned to
+/// this crate's version because the daemon (GPL `nyxstone-tricore-gcc`) ships
+/// in lockstep with it: an unpinned install would fetch the latest published
+/// daemon, which may speak a newer wire protocol and fail the handshake.
+const DAEMON_CRATE_PINNED: &str = concat!("nyxstone-tricore-gcc@", env!("CARGO_PKG_VERSION"));
+
 /// A spawned daemon process plus its connected socket.  Dropping this closes
 /// the socket and reaps the child.
 pub(crate) struct Daemon {
@@ -67,11 +73,21 @@ impl Drop for Daemon {
 /// Locate the `nyxstone-tcd` binary without installing.  Returns `None` if
 /// it's absent.  Lookup order:
 ///   1. `NYXSTONE_TCD_PATH` env var (explicit override).
-///   2. `nyxstone-tcd` on the system `PATH`.
+///   2. The directory of the current executable -- ship `nyxstone-tcd`
+///      alongside your binary and it is found with zero configuration.  This
+///      is the recommended deployment (containers, packaged apps): no PATH
+///      entry, no env var, no runtime `cargo install`.
+///   3. `nyxstone-tcd` on the system `PATH`.
 pub(crate) fn find_daemon() -> Option<PathBuf> {
     if let Ok(p) = env::var("NYXSTONE_TCD_PATH") {
         let p = PathBuf::from(p);
         if p.is_file() { return Some(p); }
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let cand = dir.join("nyxstone-tcd");
+            if cand.is_file() { return Some(cand); }
+        }
     }
     if let Some(path) = env::var_os("PATH") {
         for d in env::split_paths(&path) {
@@ -85,28 +101,43 @@ pub(crate) fn find_daemon() -> Option<PathBuf> {
 /// Human-readable "how to install" string used as the error message when
 /// the daemon can't be located.
 pub(crate) fn install_required_message() -> String {
-    "could not locate nyxstone-tcd binary.\n\
-     Install it with one of:\n  \
-       cargo install nyxstone-tricore-gcc\n  \
-       cargo binstall nyxstone-tricore-gcc             (if cargo-binstall is available)\n  \
-       nyxstone_tricore_gcc_ipc::install_daemon_if_missing()?  (programmatic)\n\
-     Or set NYXSTONE_TCD_PATH to the binary path.".to_string()
+    format!(
+    "could not locate the nyxstone-tcd daemon binary (version {ver}).\n\
+     For a DEPLOYED/containerized build, ship the daemon with your binary -- \
+     do NOT rely on a runtime `cargo install`:\n  \
+       - place `nyxstone-tcd` next to your executable, or on PATH, or\n  \
+       - set NYXSTONE_TCD_PATH to its full path.\n\
+     The daemon must be the matching version ({ver}).\n\
+     For local development you may instead call \
+     nyxstone_tricore_gcc_ipc::install_daemon_if_missing()? once (it shells out \
+     to `cargo install` and needs cargo + network).",
+        ver = env!("CARGO_PKG_VERSION"))
 }
 
-/// Install the daemon binary by invoking `cargo install nyxstone-tricore-gcc`,
-/// preferring `cargo binstall` (fetches a pre-built binary, much faster) when
-/// available on PATH.  Returns the resolved daemon path on success.
+/// Install the daemon binary by invoking `cargo install`, preferring
+/// `cargo binstall` (fetches a pre-built binary, much faster) when available
+/// on PATH.  Returns the resolved daemon path on success.
+///
+/// The install is PINNED to this crate's exact version so the daemon's wire
+/// protocol always matches the client -- an unpinned `cargo install` would
+/// fetch the latest published daemon, which may speak a newer protocol and
+/// fail the handshake.
+///
+/// This shells out to cargo (and needs network) and is intended for local
+/// development only.  DEPLOYED builds must ship the daemon instead (see
+/// `install_required_message`); do not call this from a container/CI runtime.
 ///
 /// Prints progress messages to stderr so the user sees what's happening.
 pub(crate) fn run_install() -> io::Result<PathBuf> {
     use std::process::Command;
 
+    let pinned = DAEMON_CRATE_PINNED;
+
     // Cargo's --quiet flag still leaves errors visible.
-    let try_binstall = which_on_path("cargo-binstall").is_some();
-    if try_binstall {
-        eprintln!("nyxstone-tricore-gcc-ipc: installing nyxstone-tcd via cargo binstall...");
+    if which_on_path("cargo-binstall").is_some() {
+        eprintln!("nyxstone-tricore-gcc-ipc: installing {pinned} via cargo binstall...");
         let status = Command::new("cargo")
-            .args(["binstall", "--no-confirm", "--quiet", "nyxstone-tricore-gcc"])
+            .args(["binstall", "--no-confirm", "--quiet", pinned])
             .status();
         if matches!(&status, Ok(s) if s.success()) {
             if let Some(p) = find_daemon() { return Ok(p); }
@@ -115,21 +146,22 @@ pub(crate) fn run_install() -> io::Result<PathBuf> {
         // for this target was uploaded yet).
     }
 
-    eprintln!("nyxstone-tricore-gcc-ipc: building nyxstone-tcd via \
-               'cargo install nyxstone-tricore-gcc' (one-time, ~10 s)...");
+    eprintln!("nyxstone-tricore-gcc-ipc: building {pinned} via \
+               'cargo install' (one-time, ~10 s; needs cargo + network)...");
     let status = Command::new("cargo")
-        .args(["install", "--quiet", "nyxstone-tricore-gcc"])
+        .args(["install", "--quiet", pinned])
         .status()
         .map_err(|e| io::Error::new(e.kind(),
-            format!("`cargo install nyxstone-tricore-gcc` could not be launched ({e}); \
-                     is `cargo` on PATH?")))?;
+            format!("`cargo install {pinned}` could not be launched ({e}); is `cargo` \
+                     on PATH?  A deployed build should ship nyxstone-tcd instead of \
+                     installing it at runtime.")))?;
     if !status.success() {
         return Err(io::Error::new(io::ErrorKind::Other,
-            "`cargo install nyxstone-tricore-gcc` failed; \
-             install manually or set NYXSTONE_TCD_PATH".to_string()));
+            format!("`cargo install {pinned}` failed; install manually, set \
+                     NYXSTONE_TCD_PATH, or ship nyxstone-tcd next to your binary")));
     }
     find_daemon().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound,
-        "cargo reported success but nyxstone-tcd not found on PATH; \
+        "cargo reported success but nyxstone-tcd not found; \
          check ~/.cargo/bin or set NYXSTONE_TCD_PATH".to_string()))
 }
 
@@ -197,4 +229,44 @@ fn spawn_with(bin: &Path) -> io::Result<Daemon> {
     // Default CLOEXEC=on is what we want for further exec()'s in the parent.
     let _ = parent.as_raw_fd();   // anchor lifetime
     Ok(Daemon { stream: parent, process })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The auto-install target must be pinned to this crate's exact version so
+    // the daemon's wire protocol matches the client -- an unpinned install
+    // could pull a newer, protocol-incompatible daemon.
+    #[test]
+    fn auto_install_target_is_version_pinned() {
+        assert_eq!(
+            DAEMON_CRATE_PINNED,
+            format!("nyxstone-tricore-gcc@{}", env!("CARGO_PKG_VERSION")));
+    }
+
+    // The "daemon not found" error must steer deployed builds toward shipping
+    // the binary (not a runtime install) and name the required version.
+    #[test]
+    fn missing_daemon_message_is_deployment_oriented() {
+        let m = install_required_message();
+        assert!(m.contains(env!("CARGO_PKG_VERSION")), "must name the version: {m}");
+        assert!(m.contains("NYXSTONE_TCD_PATH"), "must mention the env override: {m}");
+        assert!(m.to_lowercase().contains("ship")
+                || m.to_lowercase().contains("next to"),
+                "must point deployments at shipping the daemon: {m}");
+    }
+
+    // find_daemon honors an explicit NYXSTONE_TCD_PATH that points at a real
+    // file (the daemon under test), and rejects a path that doesn't exist.
+    // Uses the process's own env (already set for the test run) so it doesn't
+    // race other tests by mutating shared state.
+    #[test]
+    fn find_daemon_uses_explicit_path_when_valid() {
+        if let Ok(p) = env::var("NYXSTONE_TCD_PATH") {
+            if std::path::Path::new(&p).is_file() {
+                assert_eq!(find_daemon().as_deref(), Some(std::path::Path::new(&p)));
+            }
+        }
+    }
 }

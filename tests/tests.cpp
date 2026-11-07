@@ -542,6 +542,19 @@ int main() {
                 std::printf("  FAIL  relocations\n"); ++air_fail;
             } else ++air_pass;
         }
+        // `fcall` (24REL) with a leading-dot external label: the symbol.address
+        // hint comes from the supplied LabelDefinition.  Passing it -> 0x101010;
+        // an empty label list -> 0 (nothing for the library to echo).
+        auto rf = a.assemble_to_instructions_with_relocs(
+            "fcall .lbl\n", 0x10002, {{".lbl", 0x101010}});
+        if (rf && rf->relocations.size() == 1
+            && rf->relocations[0].offset == 0x10002
+            && rf->relocations[0].symbol.name == ".lbl"
+            && rf->relocations[0].symbol.address == 0x101010) ++air_pass;
+        else { std::printf("  FAIL  fcall .lbl reloc address hint\n"); ++air_fail; }
+        auto rn = a.assemble_to_instructions_with_relocs("fcall .lbl\n", 0x10002, {});
+        if (rn && rn->relocations.size() == 1 && rn->relocations[0].symbol.address == 0) ++air_pass;
+        else { std::printf("  FAIL  fcall .lbl no-label hint should be 0\n"); ++air_fail; }
     }
     std::printf("  %d assemble_to_instructions_with_relocs pass, %d fail\n", air_pass, air_fail);
 

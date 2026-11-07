@@ -700,12 +700,22 @@ mod tests {
         // LabelDefinition's address through the binding (a leading-dot label
         // name like ".lbl" must match too).
         let nx = NyxstoneTricoreGCC::new().unwrap();
-        let (_, relocs) = nx.assemble_with_relocs(
-            "j .lbl\n", 0x10002, &[LabelDefinition::new(".lbl", 0x101010)]).unwrap();
+        let labels = [LabelDefinition::new(".lbl", 0x101010)];
+        let (_, relocs) = nx.assemble_with_relocs("j .lbl\n", 0x10002, &labels).unwrap();
         assert_eq!(relocs.len(), 1);
         assert_eq!(relocs[0].offset, 0x10002);
         assert_eq!(relocs[0].symbol.name, ".lbl");
         assert_eq!(relocs[0].symbol.address, 0x101010);
         assert_eq!(relocs[0].relocation_type, 3);
+
+        // Same for the instructions+relocs variant and `fcall` (24REL).  The
+        // address hint comes ONLY from the supplied LabelDefinition; passing
+        // an empty slice leaves symbol.address == 0 (nothing to echo).
+        let (_, r2) = nx.assemble_to_instructions_with_relocs(
+            "fcall .lbl\n", 0x10002, &labels).unwrap();
+        assert_eq!(r2[0].offset, 0x10002);
+        assert_eq!(r2[0].symbol.address, 0x101010);
+        let (_, r3) = nx.assemble_to_instructions_with_relocs("fcall .lbl\n", 0x10002, &[]).unwrap();
+        assert_eq!(r3[0].symbol.address, 0, "no label provided -> no address hint");
     }
 }

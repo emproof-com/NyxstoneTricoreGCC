@@ -36,10 +36,14 @@ jobs:
       - name: Python smoke
         working-directory: bindings/python
         run: |
-          # setuptools>=77 is required for the PEP 639 SPDX `license` field in
-          # pyproject.toml (matches [build-system].requires); the runner's
-          # system setuptools is older and rejects the string form.  `setup.py
-          # build_ext` bypasses build isolation, so upgrade it explicitly.
-          python3 -m pip install --quiet --upgrade "setuptools>=77" cffi
+          # `setup.py build_ext` bypasses PEP 517 build isolation, so it needs
+          # the modern build toolchain installed in the runner's env:
+          #   - setuptools>=77 for the PEP 639 SPDX `license` field, and
+          #   - packaging>=24.2, which setuptools>=77 imports to validate that
+          #     license expression (its own dependency floor is looser, so a
+          #     stale runner packaging must be upgraded explicitly).
+          # (PEP 517 builds -- pip install / python -m build -- pull these
+          # automatically via [build-system].requires and need none of this.)
+          python3 -m pip install --quiet --upgrade "setuptools>=77" "packaging>=24.2" cffi
           python3 setup.py build_ext --inplace
           PYTHONPATH=. python3 examples/smoke.py

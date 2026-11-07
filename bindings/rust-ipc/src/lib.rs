@@ -48,9 +48,21 @@
 //!
 //! # Locating the daemon
 //!
+//! `NyxstoneTricoreGCC::new()` locates the daemon; it NEVER installs anything.
+//! Lookup order:
+//!
 //! 1. `NYXSTONE_TCD_PATH` env var (explicit path override).
-//! 2. `nyxstone-tcd` on the system `PATH`.
-//! 3. Fail with a helpful "install nyxstone-tricore-gcc" message otherwise.
+//! 2. The directory of the current executable -- **ship `nyxstone-tcd` next to
+//!    your binary and it just works**, with no PATH entry, env var, or runtime
+//!    install.  This is the recommended way to deploy (containers, packaged
+//!    apps).  The daemon must be the matching crate version.
+//! 3. `nyxstone-tcd` on the system `PATH`.
+//! 4. Otherwise `new()` returns `Err(Error::Init(...))` with an actionable
+//!    message.
+//!
+//! [`install_daemon_if_missing`] can `cargo install` the daemon on first run,
+//! but that is a **local-development convenience** (it needs cargo + network)
+//! -- do not call it from a deployed/containerized build.
 //!
 //! # Threading
 //!
@@ -161,27 +173,38 @@ impl std::error::Error for Error {}
 ///
 /// Lookup order:
 /// 1. `NYXSTONE_TCD_PATH` env var.
-/// 2. `nyxstone-tcd` on the system `PATH`.
+/// 2. The directory of the current executable (ship the daemon alongside
+///    your binary -- the recommended deployment).
+/// 3. `nyxstone-tcd` on the system `PATH`.
 ///
 /// Returns `Err(Error::Init(...))` with an actionable message if the binary
-/// isn't found.
+/// isn't found.  `NyxstoneTricoreGCC::new()` uses this same lookup and NEVER
+/// installs anything on its own.
 pub fn daemon_path() -> Result<PathBuf, Error> {
     daemon::find_daemon().ok_or_else(|| Error::Init(daemon::install_required_message()))
 }
 
-/// Ensure the `nyxstone-tcd` daemon binary is installed.
+/// Ensure the `nyxstone-tcd` daemon binary is installed **(local development
+/// convenience only)**.
 ///
-/// Skip-fast if the daemon is already locatable.  Otherwise:
-/// 1. Try `cargo binstall --no-confirm nyxstone-tricore-gcc` (fast, pulls a
-///    pre-built binary from the GitHub release if available; ~1 s on a
-///    fresh machine).
-/// 2. Fall back to `cargo install nyxstone-tricore-gcc` (~5-10 s; compiles the
-///    daemon from source using the bundled binutils-tricore prebuilts).
+/// Skip-fast if the daemon is already locatable ([`daemon_path`]).  Otherwise
+/// it shells out to `cargo` (preferring `cargo binstall`, else `cargo
+/// install`), pinned to this crate's exact version so the daemon's protocol
+/// matches the client.
 ///
-/// Intended as a one-time bootstrap call early in your `main()`:
+/// **Do NOT call this from a deployed or containerized build.**  It requires
+/// `cargo` and network access at runtime; in a minimal container both are
+/// typically absent, so it fails (and if the caller `unwrap()`s the result,
+/// the process aborts).  A deployed build should instead ship `nyxstone-tcd`
+/// next to its executable (found automatically), on `PATH`, or pointed to by
+/// `NYXSTONE_TCD_PATH` -- and simply call [`NyxstoneTricoreGCC::new`], which
+/// never installs.
+///
+/// Suitable for a local CLI/dev tool that wants zero-setup first run:
 ///
 /// ```no_run
 /// fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     // dev only; a shipped binary should NOT do this.
 ///     nyxstone_tricore_gcc_ipc::install_daemon_if_missing()?;
 ///     let nx = nyxstone_tricore_gcc_ipc::NyxstoneTricoreGCC::new()?;
 ///     // ... use nx ...
@@ -189,9 +212,7 @@ pub fn daemon_path() -> Result<PathBuf, Error> {
 /// }
 /// ```
 ///
-/// Returns the path to the installed daemon binary.  Production deployments
-/// where `cargo` is not available should ship the binary themselves and set
-/// `NYXSTONE_TCD_PATH` instead.
+/// Returns the path to the installed daemon binary.
 pub fn install_daemon_if_missing() -> Result<PathBuf, Error> {
     if let Some(p) = daemon::find_daemon() { return Ok(p); }
     daemon::run_install()
@@ -529,13 +550,22 @@ mod tests {
         // the IPC round-trip (the daemon serializes sym_addr in the protocol),
         // including a leading-dot label name.
         let nx = NyxstoneTricoreGCC::new().unwrap();
-        let (_, relocs) = nx.assemble_with_relocs(
-            "j .lbl\n", 0x10002, &[LabelDefinition::new(".lbl", 0x101010)]).unwrap();
+        let labels = [LabelDefinition::new(".lbl", 0x101010)];
+        let (_, relocs) = nx.assemble_with_relocs("j .lbl\n", 0x10002, &labels).unwrap();
         assert_eq!(relocs.len(), 1);
         assert_eq!(relocs[0].offset, 0x10002);
         assert_eq!(relocs[0].symbol.name, ".lbl");
         assert_eq!(relocs[0].symbol.address, 0x101010);
         assert_eq!(relocs[0].relocation_type, 3);
+
+        // instructions+relocs variant + `fcall` (the symbol.address hint must
+        // survive the IPC round-trip too); empty labels -> address 0.
+        let (_, r2) = nx.assemble_to_instructions_with_relocs(
+            "fcall .lbl\n", 0x10002, &labels).unwrap();
+        assert_eq!(r2[0].offset, 0x10002);
+        assert_eq!(r2[0].symbol.address, 0x101010);
+        let (_, r3) = nx.assemble_to_instructions_with_relocs("fcall .lbl\n", 0x10002, &[]).unwrap();
+        assert_eq!(r3[0].symbol.address, 0, "no label provided -> no address hint");
     }
 
     #[test]

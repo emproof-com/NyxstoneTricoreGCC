@@ -38,77 +38,67 @@ serves your requests over a UNIX socket.  The daemon is GPL-3.0-or-later
 because gas is, but it lives in a different binary, so your application's
 license stays untouched.
 
-You must obtain the daemon binary out-of-band.  Three supported install
-methods:
+You must obtain the daemon binary out-of-band.  **`NyxstoneTricoreGCC::new()`
+only ever *locates* the daemon — it never installs anything** — so pick the
+method that fits how your program is distributed.
 
-### Method 1, manual `cargo install` (simplest, recommended)
+### Deployed / containerized builds: ship the daemon (recommended)
 
-```sh
-cargo install nyxstone-tricore-gcc       # produces ~/.cargo/bin/nyxstone-tcd
-```
-
-One-time per developer machine.  Compiles the daemon from source using the
-bundled binutils-tricore prebuilts (~10 s on a typical x86_64 host, longer
-on a fresh checkout).
-
-### Method 2, `cargo binstall` (fastest, when available)
-
-If [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) is on
-PATH:
+For anything you ship (a product, a CLI, a CI/container image), **bundle
+`nyxstone-tcd` with your executable**.  Do **not** rely on a runtime
+`cargo install` — a minimal container usually has neither `cargo` nor network,
+so it fails.  The daemon must be the **matching crate version** (protocols are
+version-locked).  It is found automatically if you put it in any of:
 
 ```sh
-cargo binstall nyxstone-tricore-gcc      # downloads pre-built binary (~1 s)
+# 1. next to your binary (zero config -- found via the executable's directory)
+/opt/myapp/bin/myapp
+/opt/myapp/bin/nyxstone-tcd
+
+# 2. on PATH
+# 3. or point at it explicitly:
+NYXSTONE_TCD_PATH=/opt/myapp/bin/nyxstone-tcd myapp
 ```
 
-Skips the compile step entirely, downloads a pre-built `nyxstone-tcd` from
-the GitHub release matching the crate version.
+Then just call `NyxstoneTricoreGCC::new()`.  This is the standard pattern for a
+product shipping a GPL companion tool, like bundling `gcc` next to a
+closed-source IDE.  Grab a matching daemon with `cargo install
+nyxstone-tricore-gcc@<version>` (or `cargo binstall`) on your **build** host and
+copy the resulting `nyxstone-tcd` into your artifact.
 
-### Method 3, programmatic bootstrap (zero user steps)
+### Local development: auto-install (convenience)
 
-Call once at startup:
+For a local dev tool that wants zero-setup first run, call once at startup:
 
 ```rust
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Ensures nyxstone-tcd is installed; no-op if already present.
-    // Prefers `cargo binstall` if available, else falls back to `cargo install`.
+    // DEV ONLY: shells out to cargo (needs cargo + network), pinned to this
+    // crate's version.  A shipped/containerized binary must NOT do this --
+    // bundle the daemon instead (see above).
     nyxstone_tricore_gcc_ipc::install_daemon_if_missing()?;
-
-    // Now use the assembler normally.
     let nx = nyxstone_tricore_gcc_ipc::NyxstoneTricoreGCC::new()?;
     // ...
     Ok(())
 }
 ```
 
-The helper is idempotent and returns immediately when the daemon is already
-locatable.  Trade-off: a one-time ~1, 10 s pause on first run, in exchange
-for true zero-config developer onboarding.
-
-There's also `install_daemon()` (force-reinstall, useful when bumping the
-crate version) and `daemon_path()` (locate-only, no install).
-
-### Method 4, bring your own binary
-
-For **production deployments** (where `cargo` isn't on the customer's
-machine), ship the daemon binary alongside your product and point us at it:
-
-```sh
-NYXSTONE_TCD_PATH=/opt/myapp/bin/nyxstone-tcd myapp
-```
-
-This is the standard pattern for any commercial product shipping a GPL
-companion tool, same as bundling `gcc.exe` next to a closed-source IDE.
+It is idempotent (no-op if the daemon is already locatable), prefers
+`cargo binstall` when present, and pins the install to this crate's exact
+version.  There's also `install_daemon()` (force-reinstall) and `daemon_path()`
+(locate-only, no install).
 
 ### How daemon lookup works
 
-When `NyxstoneTricoreGCC::new()` is called, the crate looks for the daemon
-in this order:
+`NyxstoneTricoreGCC::new()` (and `daemon_path()`) look for the daemon in order:
 
-1. **`$NYXSTONE_TCD_PATH`**, explicit override, used in production.
-2. **`nyxstone-tcd` on `$PATH`**, found if you used Method 1, 2, or 3.
+1. **`$NYXSTONE_TCD_PATH`** — explicit override.
+2. **The directory of the current executable** — ship it next to your binary.
+3. **`nyxstone-tcd` on `$PATH`**.
 
-If neither resolves, you get a clear `Error::Init` message listing the
-install options.
+If none resolve, `new()` returns a clear `Error::Init` telling you to ship the
+daemon (it does **not** try to install).  It never panics — but note that if
+your program `unwrap()`s that `Result`, the panic is on your side; handle the
+error or ensure the daemon is present.
 
 ---
 
