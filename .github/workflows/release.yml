@@ -1,0 +1,112 @@
+# Builds the nyxstone-tcd daemon for `cargo binstall` and attaches it to the
+# GitHub release of a tag.  binstall needs no [package.metadata.binstall]: by
+# default it looks for
+#   {repo}/releases/download/v{version}/{name}-{target}-v{version}.tgz
+# holding {name}-{target}-v{version}/{bin}, which is what the daemon job packs.
+# A tag push v* runs it for that tag; the workflow_dispatch input backfills a
+# tag that exists already (the tag must name the crate version).
+#
+# The Linux binaries are built on ubuntu-22.04 so that they need no glibc
+# newer than 2.35; they link libz, libzstd and libstdc++ of the host.  The
+# macOS binary links the system libz and libc++; the linker signs it ad hoc.
+# nyxstone-tcd is GPL-3.0-or-later: the release notes point at the source (the
+# tag, and the binutils fork at BINUTILS_COMMIT).
+name: release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build the daemon for, for example v0.2.3"
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: The tag must name the crate version
+        run: |
+          crate=$(sed -n 's/^version *= *"\(.*\)"/\1/p' bindings/rust/Cargo.toml | head -1)
+          [ "v$crate" = "$TAG" ] || { echo "tag $TAG, crate version $crate"; exit 1; }
+
+      - name: Create the release of the tag (kept if it exists)
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then echo "release $TAG exists"; exit 0; fi
+          commit=$(cat third_party/binutils-tricore-prebuilt/BINUTILS_COMMIT)
+          cat > notes.md <<NOTES
+          \`nyxstone-tcd\` daemon of \`nyxstone-tricore-gcc\` ${TAG#v} for \`cargo binstall\`:
+
+          \`\`\`sh
+          cargo binstall nyxstone-tricore-gcc@${TAG#v}
+          \`\`\`
+
+          | asset | runs on |
+          |---|---|
+          | \`x86_64-unknown-linux-gnu\` | Linux x86-64, glibc 2.35 or newer, with libz, libzstd and libstdc++ |
+          | \`aarch64-unknown-linux-gnu\` | Linux AArch64, the same libraries |
+          | \`aarch64-apple-darwin\` | macOS on Apple silicon |
+
+          The daemon is GPL-3.0-or-later. Its source is this tag (the source archives
+          below) and the emproof binutils fork at commit \`$commit\`
+          (https://github.com/emproof-com/tricore-binutils-gdb). The MIT client crate
+          \`nyxstone-tricore-gcc-ipc\` ${TAG#v} talks to this daemon.
+          NOTES
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file notes.md
+
+  daemon:
+    needs: create
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-22.04,     target: x86_64-unknown-linux-gnu }
+          - { runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { runner: macos-15,         target: aarch64-apple-darwin }
+    runs-on: ${{ matrix.runner }}
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Host libraries (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends libzstd-dev zlib1g-dev xz-utils
+
+      - name: The runner is the target
+        run: |
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          [ "$host" = "${{ matrix.target }}" ] || { echo "host $host, target ${{ matrix.target }}"; exit 1; }
+
+      - name: Build nyxstone-tcd
+        working-directory: bindings/rust
+        run: cargo build --release --locked --bin nyxstone-tcd
+
+      - name: Pack in the layout cargo binstall expects
+        run: |
+          name="nyxstone-tricore-gcc-${{ matrix.target }}-$TAG"
+          mkdir "$name"
+          cp bindings/rust/target/release/nyxstone-tcd LICENSE "$name/"
+          tar czf "$name.tgz" "$name"
+          echo "ASSET=$name.tgz" >> "$GITHUB_ENV"
+          ls -l "$name.tgz"
+          (ldd "$name/nyxstone-tcd" || otool -L "$name/nyxstone-tcd") 2>/dev/null || true
+
+      - name: Smoke test the daemon through the client crate
+        working-directory: bindings/rust-ipc
+        run: NYXSTONE_TCD_PATH=../rust/target/release/nyxstone-tcd cargo run --release --example smoke | head -5
+
+      - name: Upload the asset to the release
+        run: gh release upload "$TAG" "$ASSET" --clobber
