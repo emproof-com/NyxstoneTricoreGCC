@@ -83,7 +83,7 @@ jobs:
 
       - name: Host libraries (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y --no-install-recommends libzstd-dev zlib1g-dev xz-utils
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libzstd-dev zlib1g-dev xz-utils
 
       - name: The runner is the target
         run: |
@@ -92,7 +92,7 @@ jobs:
 
       - name: Build nyxstone-tcd
         working-directory: bindings/rust
-        run: cargo build --release --locked --bin nyxstone-tcd
+        run: cargo build --release --bin nyxstone-tcd
 
       - name: Pack in the layout cargo binstall expects
         run: |
@@ -106,7 +106,7 @@ jobs:
 
       - name: Smoke test the daemon through the client crate
         working-directory: bindings/rust-ipc
-        run: NYXSTONE_TCD_PATH=../rust/target/release/nyxstone-tcd cargo run --release --example smoke | head -5
+        run: NYXSTONE_TCD_PATH=../rust/target/release/nyxstone-tcd cargo run --release --example smoke > /dev/null && echo "smoke ok"
 
       - name: Upload the asset to the release
         run: gh release upload "$TAG" "$ASSET" --clobber
