@@ -21,8 +21,9 @@ cargo add nyxstone-tricore-gcc-ipc    # MIT, IPC daemon, ~150 k ops/s
 pip install nyxstone-tricore-gcc
 ```
 
-Supported prebuilts: `x86_64-linux-gnu`, `aarch64-linux-gnu`, `aarch64-apple-darwin`
-(Apple silicon).  Other hosts
+Supported prebuilts: `x86_64-linux-gnu`, `aarch64-linux-gnu` (both need glibc 2.38
+or newer: Ubuntu 24.04, Debian 13, Fedora 39), `aarch64-apple-darwin` (Apple
+silicon).  Other hosts
 build binutils-tricore from source automatically (see *Binutils provisioning*
 below).
 

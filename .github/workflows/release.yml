@@ -6,9 +6,11 @@
 # A tag push v* runs it for that tag; the workflow_dispatch input backfills a
 # tag that exists already (the tag must name the crate version).
 #
-# The Linux binaries are built on ubuntu-22.04 so that they need no glibc
-# newer than 2.35; they link libz, libzstd and libstdc++ of the host.  The
-# macOS binary links the system libz and libc++; the linker signs it ad hoc.
+# The committed Linux prebuilt objects reference the glibc 2.38 symbols
+# (__isoc23_strtol and friends), so the daemon needs glibc 2.38 or newer and
+# links only on such a host: the Linux jobs run on ubuntu-24.04 (glibc 2.39).
+# The binaries link libz, libzstd and libstdc++ of the host.  The macOS binary
+# links the system libz and libc++; the linker signs it ad hoc.
 # nyxstone-tcd is GPL-3.0-or-later: the release notes point at the source (the
 # tag, and the binutils fork at BINUTILS_COMMIT).
 name: release
@@ -39,9 +41,8 @@ jobs:
           crate=$(sed -n 's/^version *= *"\(.*\)"/\1/p' bindings/rust/Cargo.toml | head -1)
           [ "v$crate" = "$TAG" ] || { echo "tag $TAG, crate version $crate"; exit 1; }
 
-      - name: Create the release of the tag (kept if it exists)
+      - name: Create the release of the tag, or refresh its notes
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then echo "release $TAG exists"; exit 0; fi
           commit=$(cat third_party/binutils-tricore-prebuilt/BINUTILS_COMMIT)
           cat > notes.md <<NOTES
           \`nyxstone-tcd\` daemon of \`nyxstone-tricore-gcc\` ${TAG#v} for \`cargo binstall\`:
@@ -52,8 +53,8 @@ jobs:
 
           | asset | runs on |
           |---|---|
-          | \`x86_64-unknown-linux-gnu\` | Linux x86-64, glibc 2.35 or newer, with libz, libzstd and libstdc++ |
-          | \`aarch64-unknown-linux-gnu\` | Linux AArch64, the same libraries |
+          | \`x86_64-unknown-linux-gnu\` | Linux x86-64, glibc 2.38 or newer (Ubuntu 24.04, Debian 13, Fedora 39), with libz, libzstd and libstdc++ |
+          | \`aarch64-unknown-linux-gnu\` | Linux AArch64, the same requirements |
           | \`aarch64-apple-darwin\` | macOS on Apple silicon |
 
           The daemon is GPL-3.0-or-later. Its source is this tag (the source archives
@@ -61,7 +62,11 @@ jobs:
           (https://github.com/emproof-com/tricore-binutils-gdb). The MIT client crate
           \`nyxstone-tricore-gcc-ipc\` ${TAG#v} talks to this daemon.
           NOTES
-          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file notes.md
+          fi
 
   daemon:
     needs: create
@@ -69,8 +74,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: ubuntu-22.04,     target: x86_64-unknown-linux-gnu }
-          - { runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { runner: ubuntu-24.04,     target: x86_64-unknown-linux-gnu }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
           - { runner: macos-15,         target: aarch64-apple-darwin }
     runs-on: ${{ matrix.runner }}
     env:
