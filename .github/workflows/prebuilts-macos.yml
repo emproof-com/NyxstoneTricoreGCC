@@ -8,6 +8,10 @@
 # or run the workflow by hand and commit the artifact's files under
 # third_party/binutils-tricore-prebuilt/aarch64-apple-darwin/.
 #
+# Every step appends its output to $RUNNER_TEMP/ci.log; on failure the tail of
+# that log is published as annotations, which the public API serves without a
+# token (the step logs need one).
+#
 # macos-14 was retired on 2026-11-02; macos-15 is the Apple silicon image.
 name: prebuilts-macos
 on:
@@ -19,28 +23,37 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
+    defaults:
+      run:
+        shell: bash -eo pipefail {0}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Host tools
+        run: |
+          { uname -a; sw_vers; xcodebuild -version || true; cc --version; make --version | head -1;
+            tar --version; xz --version | head -1; python3 --version; cargo --version; } 2>&1 | tee -a "$RUNNER_TEMP/ci.log"
+
       - name: Build the prebuilt from the binutils fork at BINUTILS_COMMIT
-        run: scripts/build_prebuilt_macos.sh
+        run: |
+          NYX_WORK_DIR="$RUNNER_TEMP/binutils" scripts/build_prebuilt_macos.sh 2>&1 | tee -a "$RUNNER_TEMP/ci.log"
 
       - name: C++ build + tests against the fresh prebuilt
-        run: make test
+        run: make test 2>&1 | tee -a "$RUNNER_TEMP/ci.log"
 
       - name: Rust GPL crate tests (nyxstone-tricore-gcc, in-process)
         working-directory: bindings/rust
-        run: cargo test --release
+        run: cargo test --release 2>&1 | tee -a "$RUNNER_TEMP/ci.log"
 
       - name: Build nyxstone-tcd daemon binary (for IPC tests)
         working-directory: bindings/rust
-        run: cargo build --release --bin nyxstone-tcd
+        run: cargo build --release --bin nyxstone-tcd 2>&1 | tee -a "$RUNNER_TEMP/ci.log"
 
       - name: Rust IPC crate tests (nyxstone-tricore-gcc-ipc, via daemon)
         working-directory: bindings/rust-ipc
         run: |
           NYXSTONE_TCD_PATH=../rust/target/release/nyxstone-tcd \
-            cargo test --release
+            cargo test --release 2>&1 | tee -a "$RUNNER_TEMP/ci.log"
 
       - uses: actions/setup-python@v5
         with:
@@ -49,9 +62,17 @@ jobs:
       - name: Python smoke
         working-directory: bindings/python
         run: |
-          python3 -m pip install --quiet --upgrade "setuptools>=77" "packaging>=24.2" cffi
-          python3 setup.py build_ext --inplace
-          PYTHONPATH=. python3 examples/smoke.py
+          { python3 -m pip install --quiet --upgrade "setuptools>=77" "packaging>=24.2" cffi
+            python3 setup.py build_ext --inplace
+            PYTHONPATH=. python3 examples/smoke.py; } 2>&1 | tee -a "$RUNNER_TEMP/ci.log"
+
+      - name: Publish the log tail as annotations
+        if: failure()
+        run: |
+          for f in "$RUNNER_TEMP"/binutils/build/configure.log "$RUNNER_TEMP"/binutils/build/build.log; do
+            [ -f "$f" ] && { echo "== $f (tail)"; tail -40 "$f"; } >> "$RUNNER_TEMP/ci.log"
+          done
+          python3 scripts/ci_log_annotations.py "$RUNNER_TEMP/ci.log"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -66,5 +87,5 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add third_party/binutils-tricore-prebuilt/aarch64-apple-darwin
           git diff --quiet --staged && { echo "prebuilt unchanged"; exit 0; }
-          git commit -m "Refresh the aarch64-apple-darwin prebuilt (built on ${RUNNER_OS} ${ImageOS:-}, run ${GITHUB_RUN_ID})"
+          git commit -m "Refresh the aarch64-apple-darwin prebuilt (run ${GITHUB_RUN_ID})"
           git push
