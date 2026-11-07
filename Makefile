@@ -3,7 +3,7 @@
 # Quick start:
 #   make                         # auto-extracts committed prebuilts, then
 #                                # builds the library, tests, and examples
-#   make test                    # run the 118-test matrix
+#   make test                    # run the 170-test matrix
 #   make bench                   # run the throughput benchmark
 #
 # Binutils provisioning (in order of preference):
@@ -104,7 +104,7 @@ bench: examples/bench.cpp libnyxstone_tricore.a
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< \
 	  libnyxstone_tricore.a $(GAS_OBJS) $(BINUTILS_LIBS) $(SYSTEM_LIBS) -o $@
 
-run_tests: tests/tests.cpp libnyxstone_tricore.a
+run_tests: tests/tests.cpp tests/branch_relax_corpus.inc libnyxstone_tricore.a
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< \
 	  libnyxstone_tricore.a $(GAS_OBJS) $(BINUTILS_LIBS) $(SYSTEM_LIBS) -o $@
 

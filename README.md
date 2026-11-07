@@ -100,7 +100,7 @@ nopic+pic) on first run, no network access needed:
 # 1. Build the C++ library + tests + examples (~5 s on first run).
 make                    # or:  cmake -S . -B build && cmake --build build -j
 
-# 2. Run the test suite (162 + extra API tests).
+# 2. Run the test suite (170 + extra API tests).
 make test               # or:  ctest --test-dir build --output-on-failure
 
 # 3. Try an example.
@@ -339,7 +339,7 @@ NyxstoneTricoreGCC/
 │   ├── nyxstone.cpp               C++ implementation
 │   ├── nyxstone_glue.c            The only TU that touches gas internals
 │   └── nyxstone_c.cpp             C ABI wrapper
-├── tests/tests.cpp                162-test matrix + stress + round-trip + API checks
+├── tests/tests.cpp                170-test matrix + stress + round-trip + API checks
 ├── examples/{smoke,bench}.cpp     Demo and throughput benchmark
 ├── bindings/
 │   ├── rust/                      nyxstone-tricore-gcc (GPL) crate + nyxstone-tcd daemon
@@ -360,14 +360,15 @@ NyxstoneTricoreGCC/
 
 ## Tests
 
-`tests/tests.cpp` ships a 162-test matrix split into twelve groups:
+`tests/tests.cpp` ships a 170-test matrix split into twelve groups:
 
 - **insn** (47): every TriCore format we exercise (SR/SRR/SLR/SSR/SC/SRC/RC/
   RR/RLC/B), various register kinds, immediate widths, signedness.
 - **label** (12): forward + backward branches, multi-label lines
   (`a: b: nop`), `.L0`/`$x`/`_x` naming variants, label-only sources.
-- **relax** (2): local branches shrink to their 2-byte short form in both
-  directions.
+- **relax** (10): local branches shrink to their 2-byte short form in both
+  directions: `j`, the SB forms `jz`/`jnz %d15` (also spelled `jeq`/`jne
+  %d15, 0`), SBR `jz %d1` and SBC `jeq %d15, const4`.
 - **data** (36): every data directive Nyxstone supports, `.byte` /
   `.half` / `.hword` / `.short` / `.2byte` / `.word` / `.int` / `.long` /
   `.4byte` / `.quad` / `.8byte` / `.ascii` / `.asciz` / `.string` /
@@ -392,12 +393,12 @@ NyxstoneTricoreGCC/
   out-of-range immediates -- all must reject instead of emitting silently
   wrong bytes.
 
-After the core matrix, post-matrix checks (194 assertions) cover:
+After the core matrix, post-matrix checks (787 assertions) cover:
 
 - 100× stress per test catches state-reset drift across consecutive
   `assemble()` calls.
 - Every BYTES test of ≥2 bytes is round-tripped through
-  `disassemble_to_instructions()` (128 cases).
+  `disassemble_to_instructions()` (136 cases).
 - `LabelDefinition` external symbols (exact displacement bytes + address
   invariance), the `address` parameter propagating to `Instruction.address`,
   the `count` parameter, relocation records, and branch displacement
@@ -427,6 +428,16 @@ After the core matrix, post-matrix checks (194 assertions) cover:
 - Error-message quality (gas diagnostics + offending symbol names appear in
   the returned error; nothing leaks to the host stderr) and 32-bit masking
   of printed branch targets.
+- **Branch relaxation sweep vs gas**: every PC-relative branch form (`j`,
+  `jl`, `call`, `fcall`, `jz`/`jnz`, `jeq`/`jne`, `jlt`/`jge` and their
+  `.u` forms, `jgez`/`jgtz`/`jlez`/`jltz`, `jz.a`/`jnz.a`/`jeq.a`/`jne.a`,
+  `jz.t`/`jnz.t`, `jned`/`jnei`, `loop`/`loopu`, with `%d15` and other
+  registers) forward and backward, at distances that select each encoding
+  of its relax chain (16-bit, 32-bit, 32-bit plus a `j` beyond disp15):
+  590 sources whose bytes come from `tricore-elf-as -mtc162 --no-reloc`
+  ([`scripts/gen_branch_relax_corpus.py`](scripts/gen_branch_relax_corpus.py)
+  into [`tests/branch_relax_corpus.inc`](tests/branch_relax_corpus.inc)).
+  Each source is assembled at two addresses; the bytes must be the same.
 
 A separate `roundtrip_all` test (also run by `make test`) is exhaustive over
 the **whole v1.6.2 instruction set**: it drives all 398 instruction/format
@@ -461,11 +472,11 @@ protocol frame caps).
 
 ```
 $ ./run_tests
-... (162 tests in 12 groups) ...
+... (170 tests in 12 groups) ...
 --- 100x stress (each non-MUST_FAIL test 100 iterations) ---
-  PASS: no drift across 142 non-fail tests * 100 iterations
+  PASS: no drift across 150 non-fail tests * 100 iterations
 --- disassembly round-trip ---
-  128 round-trip pass, 0 fail
+  136 round-trip pass, 0 fail
 --- resolution-path reloc encodings ---
   12 resolution-reloc pass, 0 fail
 --- relocation offsets ---
@@ -477,9 +488,11 @@ $ ./run_tests
 --- v1.6 instruction set / annotation strip / load-store label resolution ---
   5 v1.6-isa, 4 annotation-strip, 9 load-store-label pass, 0 fail
   ... (external-label, relocs, branch, error-message, masking checks) ...
-Summary: 162 passed, 0 failed, 0 drifts (of 162 tests);
-         128 disasm round-trips passed, 0 failed;
-         194 additional API checks passed, 0 failed
+--- branch relaxation sweep vs gas ---
+  590 branch-relax pass, 0 fail (590 sources x 2 addresses)
+Summary: 170 passed, 0 failed, 0 drifts (of 170 tests);
+         136 disasm round-trips passed, 0 failed;
+         787 additional API checks passed, 0 failed
 ```
 
 ## Threading

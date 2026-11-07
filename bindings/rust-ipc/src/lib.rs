@@ -611,4 +611,78 @@ mod tests {
         // The fresh connection keeps working.
         assert_eq!(nx.assemble("ret", 0, &[]).unwrap().len(), 2);
     }
+
+    // `jz`/`jnz %d15` and the `jeq`/`jne %d15, 0` spellings relax to the
+    // 2-byte SB form (0x6e/0xee, disp8) for a near local target, as gas does.
+    // The relax chain of this form starts at md_relax_table[0]; a chain walk
+    // that skipped index 0 left the 4-byte BRC form (df 0f ..), 2 bytes more
+    // per branch than the GNU path.
+    #[test]
+    fn relax_d15_zero_compare_short_form() {
+        let nx = NyxstoneTricoreGCC::new().unwrap();
+        let cases: [(&str, &[u8]); 8] = [
+            ("jeq %d15, 0, .nt\nnop\n.nt:\nnop\n", &[0x6e, 0x02, 0, 0, 0, 0]),
+            ("jz %d15, .nt\nnop\n.nt:\nnop\n",     &[0x6e, 0x02, 0, 0, 0, 0]),
+            ("jne %d15, 0, .nt\nnop\n.nt:\nnop\n", &[0xee, 0x02, 0, 0, 0, 0]),
+            (".nt:\nnop\njeq %d15, 0, .nt\n",      &[0, 0, 0x6e, 0xff]),
+            (".nt:\nnop\njz %d15, .nt\n",          &[0, 0, 0x6e, 0xff]),
+            ("jz %d15, 1f\nnop\n1:\nnop\n",        &[0x6e, 0x02, 0, 0, 0, 0]),
+            // The other 16-bit forms, SBR `jz %d1` and SBC `jeq %d15, const4`.
+            ("jeq %d1, 0, .nt\nnop\n.nt:\nnop\n",  &[0x76, 0x12, 0, 0, 0, 0]),
+            ("jeq %d15, 3, .nt\nnop\n.nt:\nnop\n", &[0x1e, 0x32, 0, 0, 0, 0]),
+        ];
+        for (src, expect) in cases {
+            assert_eq!(nx.assemble(src, 0x8000, &[]).unwrap(), expect, "{src:?}");
+        }
+        // A LabelDefinition target keeps the long, value-independent form
+        // (the inverted 2-byte branch over a 4-byte `j`), which is what the
+        // GNU path (gas + linker script) gives for the same input.
+        let labels = [LabelDefinition::new("t", 0x8010)];
+        assert_eq!(nx.assemble("jz %d15, t\n", 0x8000, &labels).unwrap(),
+                   vec![0xee, 0x03, 0x1d, 0x00, 0x07, 0x00]);
+    }
+
+    /// The bytes of `tricore-as -mtc162 --no-reloc` for every PC-relative
+    /// branch form, forward and backward, at distances that select each
+    /// encoding of its relax chain (scripts/gen_branch_relax_corpus.py).
+    const BRANCH_RELAX_CORPUS: &str = include_str!("../../../tests/branch_relax_corpus.inc");
+
+    /// Parses the corpus: one C++ initializer per line,
+    /// `{"<source, \n-escaped>", "<tokens>"},` with a token either hex bytes
+    /// or `z<n>` for n zero bytes.
+    fn branch_relax_cases() -> Vec<(String, Vec<u8>)> {
+        BRANCH_RELAX_CORPUS.lines()
+            .filter(|l| l.starts_with("{\""))
+            .map(|l| {
+                let body = &l[2..l.len() - "\"},".len()];
+                let (src, tokens) = body.split_once("\", \"").unwrap();
+                let mut bytes = Vec::new();
+                for tok in tokens.split(' ') {
+                    if let Some(n) = tok.strip_prefix('z') {
+                        bytes.resize(bytes.len() + n.parse::<usize>().unwrap(), 0);
+                    } else {
+                        for i in (0..tok.len()).step_by(2) {
+                            bytes.push(u8::from_str_radix(&tok[i..i + 2], 16).unwrap());
+                        }
+                    }
+                }
+                (src.replace("\\n", "\n"), bytes)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn branch_relax_sweep_matches_gas() {
+        let nx = NyxstoneTricoreGCC::new().unwrap();
+        let cases = branch_relax_cases();
+        assert!(cases.len() > 500, "corpus parsed: {} cases", cases.len());
+        for (src, expect) in &cases {
+            // The same source at two addresses gives the same bytes.
+            for addr in [0x8000u64, 0x8000_0000] {
+                let got = nx.assemble(src, addr, &[]).unwrap();
+                assert!(got == *expect, "{src:?} at {addr:#x}: got {:02x?}.., gas {:02x?}..",
+                        &got[..got.len().min(12)], &expect[..expect.len().min(12)]);
+            }
+        }
+    }
 }

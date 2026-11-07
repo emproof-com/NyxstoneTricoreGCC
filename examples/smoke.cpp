@@ -2,7 +2,7 @@
 //
 // Demonstrates the public C++ API: assemble(), assemble_to_instructions(),
 // disassemble(), and disassemble_to_instructions().  See tests/tests.cpp
-// for the full 118-test matrix.
+// for the full 170-test matrix.
 
 #include "nyxstone/nyxstone.h"
 

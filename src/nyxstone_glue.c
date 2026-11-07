@@ -468,16 +468,26 @@ static void finalize_align_org (segT seg)
 
 /* Walk md_relax_table backwards from `sub` to the head (shortest encoding) of
    its relax chain.  rlx_more only ever points to a *longer* state, so the head
-   is the subtype that no other entry's rlx_more refers to.  Index 0 is gas's
-   reserved "no relax" sentinel and is excluded from the predecessor search. */
+   is the subtype that no other entry's rlx_more refers to.
+
+   Index 0 is a real state in this port (RELAX_SB, the 2-byte `jz %d15` /
+   `jnz %d15` form that `jeq/jne %d15, 0, label` also assembles to), not the
+   "no relax" sentinel some other gas ports reserve there.  Two consequences:
+   the predecessor search must include index 0, and a terminal entry's
+   rlx_more == 0 marks the end of its chain, it is not a link to state 0.
+   Treating it as one walked the SB chain 0 -> 2 -> 1 and left every
+   `jz/jnz %d15` in the 4-byte BRC form where gas picks the 2-byte one. */
 static relax_substateT chain_head (relax_substateT sub)
 {
     for (int guard = 0; guard < MD_RELAX_TABLE_N; ++guard) {
-        relax_substateT pred = 0;
-        for (int i = 1; i < MD_RELAX_TABLE_N; ++i)
-            if (md_relax_table[i].rlx_more == sub) { pred = (relax_substateT) i; break; }
-        if (!pred) break;
-        sub = pred;
+        int pred = -1;
+        for (int i = 0; i < MD_RELAX_TABLE_N; ++i)
+            if (md_relax_table[i].rlx_more != 0 && md_relax_table[i].rlx_more == sub) {
+                pred = i;
+                break;
+            }
+        if (pred < 0) break;
+        sub = (relax_substateT) pred;
     }
     return sub;
 }
