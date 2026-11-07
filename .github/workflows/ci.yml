@@ -1,6 +1,7 @@
-# Minimal CI: extract prebuilts → build → run all three surfaces' tests.
-# Designed for the free public-repo tier: single ubuntu-latest x86_64 job,
-# ~45-60 seconds wall clock end-to-end.
+# Minimal CI: extract prebuilts → build → run all three surfaces' tests, on
+# Linux x86_64 and on macOS (Apple silicon).  Designed for the free public-repo
+# tier: ~45-60 seconds wall clock for the Linux job.  The macOS prebuilt
+# itself is built by prebuilts-macos.yml (manual).
 name: ci
 on:
   push:
@@ -44,6 +45,39 @@ jobs:
           #     stale runner packaging must be upgraded explicitly).
           # (PEP 517 builds -- pip install / python -m build -- pull these
           # automatically via [build-system].requires and need none of this.)
+          python3 -m pip install --quiet --upgrade "setuptools>=77" "packaging>=24.2" cffi
+          python3 setup.py build_ext --inplace
+          PYTHONPATH=. python3 examples/smoke.py
+
+  test-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: C++ build + tests
+        run: make test
+
+      - name: Rust GPL crate tests (nyxstone-tricore-gcc, in-process)
+        working-directory: bindings/rust
+        run: cargo test --release
+
+      - name: Build nyxstone-tcd daemon binary (for IPC tests)
+        working-directory: bindings/rust
+        run: cargo build --release --bin nyxstone-tcd
+
+      - name: Rust IPC crate tests (nyxstone-tricore-gcc-ipc, via daemon)
+        working-directory: bindings/rust-ipc
+        run: |
+          NYXSTONE_TCD_PATH=../rust/target/release/nyxstone-tcd \
+            cargo test --release
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python smoke
+        working-directory: bindings/python
+        run: |
           python3 -m pip install --quiet --upgrade "setuptools>=77" "packaging>=24.2" cffi
           python3 setup.py build_ext --inplace
           PYTHONPATH=. python3 examples/smoke.py

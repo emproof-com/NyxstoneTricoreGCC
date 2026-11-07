@@ -1,11 +1,10 @@
 # Builds the aarch64-apple-darwin prebuilt of binutils-tricore natively on a
 # hosted Apple silicon runner (free for a public repository), tests every
 # surface of the library against it, and uploads the tarballs as an artifact.
-# On the macos-prebuilts branch it also commits the tarballs back, which
-# refreshes the committed prebuilt without a download (a push with the
-# workflow token starts no new run).  To refresh after a bump of
-# BINUTILS_COMMIT or a change of the recipe: push the change to that branch,
-# or run the workflow by hand and commit the artifact's files under
+# Run by hand (workflow_dispatch) after a bump of BINUTILS_COMMIT or a change
+# of the recipe; with the `commit` input it commits the tarballs back to the
+# branch it ran on (a push with the workflow token starts no new run), else
+# take them from the artifact and commit them under
 # third_party/binutils-tricore-prebuilt/aarch64-apple-darwin/.
 #
 # Every step appends its output to $RUNNER_TEMP/ci.log; on failure the tail of
@@ -16,8 +15,11 @@
 name: prebuilts-macos
 on:
   workflow_dispatch:
-  push:
-    branches: [macos-prebuilts]
+    inputs:
+      commit:
+        description: "Commit the tarballs back to the branch"
+        type: boolean
+        default: false
 permissions:
   contents: write
 jobs:
@@ -81,7 +83,7 @@ jobs:
           if-no-files-found: error
 
       - name: Commit the tarballs back to the branch
-        if: github.event_name == 'push' && github.ref == 'refs/heads/macos-prebuilts'
+        if: inputs.commit
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
