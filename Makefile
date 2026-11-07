@@ -59,9 +59,9 @@ GLUE_INCLUDES := -I $(NYX_BINUTILS)/gas-internal-headers \
 GAS_OBJS := $(wildcard $(NYX_BINUTILS)/lib/gas/*.o) \
             $(wildcard $(NYX_BINUTILS)/lib/gas/config/*.o)
 
-# Library archives.
-BINUTILS_LIBS := -L $(NYX_BINUTILS)/lib \
-                 -l:libopcodes.a -l:libbfd.a -l:libiberty.a -l:libsframe.a
+# Library archives, by path: Apple's ld has no `-l:name.a` form.
+BINUTILS_LIBS := $(NYX_BINUTILS)/lib/libopcodes.a $(NYX_BINUTILS)/lib/libbfd.a \
+                 $(NYX_BINUTILS)/lib/libiberty.a $(NYX_BINUTILS)/lib/libsframe.a
 # The macOS prebuilt is built --without-zstd; clang++ links libc++ by itself.
 ifeq ($(shell uname -s),Darwin)
 SYSTEM_LIBS   := -lz
