@@ -1,6 +1,6 @@
 // build.rs, extracts the bundled binutils-tricore prebuilts for the host
-// arch + PIC variant, compiles the C++ wrapper sources via the `cc` crate,
-// and emits cargo link directives for everything.
+// OS + arch + PIC variant, compiles the C++ wrapper sources via the `cc`
+// crate, and emits cargo link directives for everything.
 //
 // All source files and prebuilt tarballs are picked up from the symlinked
 // `nyxstone-tricore-gcc/` directory inside this crate.  This makes the
@@ -35,15 +35,18 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", root.display());
 
-    // ---- 1. Resolve host arch + PIC variant ---------------------------------
+    // ---- 1. Resolve host OS + arch + PIC variant ----------------------------
+    let target_os   = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
-    let arch_dir = match target_arch.as_str() {
-        "x86_64"  => "x86_64-linux-gnu",
-        "aarch64" => "aarch64-linux-gnu",
-        other => panic!(
-            "nyxstone-tricore-gcc: no bundled prebuilt for target arch '{other}'.\n\
-             Supported: x86_64, aarch64.  For other arches, build binutils from\n\
-             source and point NYX_EXTRACTED_DIR at the resulting tree."
+    let arch_dir = match (target_os.as_str(), target_arch.as_str()) {
+        ("linux", "x86_64")  => "x86_64-linux-gnu",
+        ("linux", "aarch64") => "aarch64-linux-gnu",
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        (os, arch) => panic!(
+            "nyxstone-tricore-gcc: no bundled prebuilt for target '{arch}-{os}'.\n\
+             Supported: x86_64-linux-gnu, aarch64-linux-gnu, aarch64-apple-darwin.\n\
+             For other hosts, build binutils from source (scripts/fetch_binutils.sh)\n\
+             and point NYX_EXTRACTED_DIR at the resulting tree."
         ),
     };
     let pic = env::var("NYX_BINUTILS_PIC").unwrap_or_default() == "1";
@@ -134,7 +137,11 @@ fn main() {
     for l in &["opcodes", "bfd", "iberty", "sframe"] {
         println!("cargo:rustc-link-lib=static:-bundle={l}");
     }
-    for sys in &["z", "zstd", "dl", "m", "stdc++"] {
+    // System libraries.  The macOS prebuilt is built --without-zstd (a Mac has
+    // no libzstd unless Homebrew put it there) and its C++ runtime is libc++.
+    let sys: &[&str] = if target_os == "macos" { &["z", "c++"] }
+                       else { &["z", "zstd", "dl", "m", "stdc++"] };
+    for sys in sys {
         println!("cargo:rustc-link-lib={sys}");
     }
 }

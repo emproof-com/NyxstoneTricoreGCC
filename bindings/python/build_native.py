@@ -29,16 +29,18 @@ ROOT = "nyxstone-tricore-gcc"                  # symlink view of the repo
 PREBUILT = os.path.join(ROOT, "binutils-prebuilt")
 
 # ----- Prebuilt variant selection -------------------------------------------
-_ARCH_MAP = {
-    "x86_64":  "x86_64-linux-gnu",
-    "aarch64": "aarch64-linux-gnu",
-    "arm64":   "aarch64-linux-gnu",
+_PREBUILT_HOSTS = {
+    ("Linux", "x86_64"):   "x86_64-linux-gnu",
+    ("Linux", "aarch64"):  "aarch64-linux-gnu",
+    ("Linux", "arm64"):    "aarch64-linux-gnu",
+    ("Darwin", "arm64"):   "aarch64-apple-darwin",
 }
+_DARWIN = platform.system() == "Darwin"
 
 
 def host_arch():
     """Prebuilt directory name for this host, or None if unsupported."""
-    return _ARCH_MAP.get(platform.machine())
+    return _PREBUILT_HOSTS.get((platform.system(), platform.machine()))
 
 
 def pic_variant():
@@ -69,9 +71,9 @@ def extract_prebuilts():
     if arch is None:
         raise RuntimeError(
             f"no bundled binutils-tricore prebuilt for host "
-            f"'{platform.machine()}'.\n"
-            f"  Supported: {sorted(set(_ARCH_MAP.values()))}\n"
-            f"  Other arches: build from source and set NYX_EXTRACTED_DIR.")
+            f"'{platform.system()} {platform.machine()}'.\n"
+            f"  Supported: {sorted(set(_PREBUILT_HOSTS.values()))}\n"
+            f"  Other hosts: build from source and set NYX_EXTRACTED_DIR.")
     if os.path.exists(EXTRACTED):
         shutil.rmtree(EXTRACTED)
     _extract(os.path.join(PREBUILT, "headers-shared.tar.xz"), EXTRACTED)
@@ -172,10 +174,12 @@ ffibuilder.set_source(
     # extra_objects (the extracted gas .o files) are injected at build time
     # by setup.py's build_ext, after extract_prebuilts() has run.
     extra_objects   = [],
-    libraries       = ["opcodes", "bfd", "iberty", "sframe",
-                       "z", "zstd", "dl", "m", "stdc++"],
+    # The macOS prebuilt is built --without-zstd and its C++ runtime is libc++;
+    # --no-as-needed is a GNU ld option.
+    libraries       = ["opcodes", "bfd", "iberty", "sframe", "z"]
+                      + (["c++"] if _DARWIN else ["zstd", "dl", "m", "stdc++"]),
     library_dirs    = [os.path.join(EXTRACTED, "lib")],
     # -std=c++17 is added per-source (only for the .cpp TUs) by setup.py's
     # build_ext; passing it here would also hit the C sources and error.
-    extra_link_args = ["-Wl,--no-as-needed"],
+    extra_link_args = [] if _DARWIN else ["-Wl,--no-as-needed"],
 )

@@ -62,7 +62,12 @@ GAS_OBJS := $(wildcard $(NYX_BINUTILS)/lib/gas/*.o) \
 # Library archives.
 BINUTILS_LIBS := -L $(NYX_BINUTILS)/lib \
                  -l:libopcodes.a -l:libbfd.a -l:libiberty.a -l:libsframe.a
+# The macOS prebuilt is built --without-zstd; clang++ links libc++ by itself.
+ifeq ($(shell uname -s),Darwin)
+SYSTEM_LIBS   := -lz
+else
 SYSTEM_LIBS   := -lz -lzstd -ldl -lm -lstdc++
+endif
 
 .PHONY: all clean test bench smoke prebuilt fetch_binutils
 

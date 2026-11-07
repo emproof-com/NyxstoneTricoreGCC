@@ -1,0 +1,55 @@
+# Builds the aarch64-apple-darwin prebuilt of binutils-tricore natively on a
+# hosted Apple silicon runner (free for a public repository), tests every
+# surface of the library against it, and uploads the tarballs as an artifact.
+# To refresh the committed prebuilt (after a bump of BINUTILS_COMMIT or a
+# change of the recipe), put the artifact's files under
+# third_party/binutils-tricore-prebuilt/aarch64-apple-darwin/ and commit.
+name: prebuilts-macos
+on:
+  workflow_dispatch:
+  push:
+    branches: [macos-prebuilts]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the prebuilt from the binutils fork at BINUTILS_COMMIT
+        run: scripts/build_prebuilt_macos.sh
+
+      - name: C++ build + tests against the fresh prebuilt
+        run: make test
+
+      - name: Rust GPL crate tests (nyxstone-tricore-gcc, in-process)
+        working-directory: bindings/rust
+        run: cargo test --release
+
+      - name: Build nyxstone-tcd daemon binary (for IPC tests)
+        working-directory: bindings/rust
+        run: cargo build --release --bin nyxstone-tcd
+
+      - name: Rust IPC crate tests (nyxstone-tricore-gcc-ipc, via daemon)
+        working-directory: bindings/rust-ipc
+        run: |
+          NYXSTONE_TCD_PATH=../rust/target/release/nyxstone-tcd \
+            cargo test --release
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python smoke
+        working-directory: bindings/python
+        run: |
+          python3 -m pip install --quiet --upgrade "setuptools>=77" "packaging>=24.2" cffi
+          python3 setup.py build_ext --inplace
+          PYTHONPATH=. python3 examples/smoke.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binutils-tricore-prebuilt-aarch64-apple-darwin
+          path: third_party/binutils-tricore-prebuilt/aarch64-apple-darwin
+          if-no-files-found: error

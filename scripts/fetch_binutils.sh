@@ -43,16 +43,20 @@ fi
 if [[ ! -d "$BUILD/gas" ]]; then
     echo ">>> Configuring binutils (target=tricore-elf) in $BUILD"
     mkdir -p "$BUILD"
+    # macOS: no libzstd outside Homebrew (the objects must not depend on it),
+    # and no makeinfo (the docs are not shipped).
+    HOST_ARGS=""
+    [[ "$(uname -s)" == Darwin ]] && HOST_ARGS="--without-zstd"
     (cd "$BUILD" && "$SRC/configure" \
         --target=tricore-elf \
         --prefix="$PREFIX" \
-        --with-gnu-as --with-gnu-ld --with-system-zlib \
+        --with-gnu-as --with-gnu-ld --with-system-zlib $HOST_ARGS \
         --disable-gdb --disable-sim --disable-libdecnumber \
         --disable-readline --disable-werror --disable-nls \
         --disable-bootstrap --disable-multilib \
         --program-transform-name='s&^&tricore-elf-&')
     echo ">>> Building binutils (this takes a few minutes${EXTRA_CFLAGS:+, with $EXTRA_CFLAGS})"
-    make -C "$BUILD" -j"$(nproc)" \
+    make -C "$BUILD" -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" MAKEINFO=true \
         ${EXTRA_CFLAGS:+CFLAGS="-O2 $EXTRA_CFLAGS"} \
         ${EXTRA_CFLAGS:+CXXFLAGS="-O2 $EXTRA_CFLAGS"} \
         all-binutils all-gas all-ld all-opcodes
@@ -77,9 +81,17 @@ for f in "$BUILD/gas"/*.o; do
     if [[ "$name" == "as.o" ]]; then continue; fi
     cp "$f" "$TP/lib/gas/"
 done
-# Renamed as.o so its main() doesn't conflict with ours.
-cp "$BUILD/gas/as.o" "$TP/lib/gas/as_renamed.o"
-"${OBJCOPY:-objcopy}" --redefine-sym main=gas_main "$TP/lib/gas/as_renamed.o"
+# Renamed as.o so its main() doesn't conflict with ours.  macOS has no
+# objcopy (and Mach-O symbols carry a leading underscore), so there as.o is
+# rebuilt with the rename done by the preprocessor.
+if [[ "$(uname -s)" == Darwin ]]; then
+    rm -f "$BUILD/gas/as.o"
+    make -C "$BUILD/gas" as.o CFLAGS="-O2 ${EXTRA_CFLAGS} -Dmain=gas_main" >/dev/null
+    cp "$BUILD/gas/as.o" "$TP/lib/gas/as_renamed.o"
+else
+    cp "$BUILD/gas/as.o" "$TP/lib/gas/as_renamed.o"
+    "${OBJCOPY:-objcopy}" --redefine-sym main=gas_main "$TP/lib/gas/as_renamed.o"
+fi
 # Target-specific gas config objects.
 cp "$BUILD/gas/config/obj-elf.o" "$TP/lib/gas/config/"
 cp "$BUILD/gas/config/tc-tricore.o" "$TP/lib/gas/config/"

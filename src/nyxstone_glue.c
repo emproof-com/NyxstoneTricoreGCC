@@ -73,9 +73,9 @@ static int g_initialized = 0;
    stderr FILE stream (messages.c).  A library must not spam the host
    process's stderr, and the caller needs the text to produce an actionable
    error.  While a capture is active we swap the `stderr` global for a
-   fopencookie(3) stream that appends into a growable buffer (glibc-specific,
-   like the rest of the Linux-only daemon machinery).  Single-threaded by
-   contract (see nyxstone.h), so the global swap is safe. */
+   stream that appends into a growable buffer: fopencookie(3) on glibc,
+   funopen(3) on macOS (both let a FILE write into a callback).
+   Single-threaded by contract (see nyxstone.h), so the global swap is safe. */
 
 typedef struct { char *buf; size_t len; size_t cap; } growbuf_t;
 
@@ -98,19 +98,32 @@ static growbuf_t g_caplog;
 static FILE *g_cap_stream    = NULL;
 static FILE *g_saved_stderr  = NULL;
 
+#ifdef __APPLE__
+/* funopen(3) write callback: the BSD signature counts in int. */
+static int cap_write (void *cookie, const char *data, int n)
+{
+    growbuf_append ((growbuf_t *) cookie, data, (size_t) n);
+    return n;
+}
+#else
 static ssize_t cap_write (void *cookie, const char *data, size_t n)
 {
     growbuf_append ((growbuf_t *) cookie, data, n);
     return (ssize_t) n;
 }
+#endif
 
 void nyxstone_glue_begin_capture (void)
 {
     g_caplog.len = 0;
     if (g_caplog.buf) g_caplog.buf[0] = 0;
     if (!g_cap_stream) {
+#ifdef __APPLE__
+        g_cap_stream = funopen (&g_caplog, NULL, cap_write, NULL, NULL);
+#else
         cookie_io_functions_t io = { NULL, cap_write, NULL, NULL };
         g_cap_stream = fopencookie (&g_caplog, "w", io);
+#endif
         if (g_cap_stream) setvbuf (g_cap_stream, NULL, _IONBF, 0);
     }
     if (g_cap_stream && !g_saved_stderr) {

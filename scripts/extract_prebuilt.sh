@@ -2,14 +2,14 @@
 # Extract the committed binutils-tricore-prebuilt tarballs into
 # third_party/binutils-tricore/ so `make` can link against them.
 #
-# Picks the host-arch + PIC/non-PIC variant automatically.
+# Picks the host OS + arch + PIC/non-PIC variant automatically.
 #
 # Usage:
 #   scripts/extract_prebuilt.sh               # default: host arch, non-PIC
 #   NYX_BINUTILS_PIC=1 scripts/extract_prebuilt.sh
 #                                             # use PIC variant
 #
-# Returns 0 if extraction succeeded, 2 if no prebuilt matches the host arch
+# Returns 0 if extraction succeeded, 2 if no prebuilt matches the host
 # (Makefile uses this to fall back to fetch_binutils.sh).
 
 set -euo pipefail
@@ -18,11 +18,12 @@ PB="$HERE/third_party/binutils-tricore-prebuilt"
 TP="$HERE/third_party/binutils-tricore"
 PIC="${NYX_BINUTILS_PIC:-0}"
 
-case "$(uname -m)" in
-    x86_64)  ARCH=x86_64-linux-gnu  ;;
-    aarch64|arm64) ARCH=aarch64-linux-gnu ;;
+case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64)              ARCH=x86_64-linux-gnu     ;;
+    Linux-aarch64|Linux-arm64) ARCH=aarch64-linux-gnu    ;;
+    Darwin-arm64)              ARCH=aarch64-apple-darwin ;;
     *)
-        echo "extract_prebuilt: no prebuilt for $(uname -m), must build from source." >&2
+        echo "extract_prebuilt: no prebuilt for $(uname -s)-$(uname -m), must build from source." >&2
         exit 2
         ;;
 esac
