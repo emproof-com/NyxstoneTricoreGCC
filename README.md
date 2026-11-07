@@ -21,7 +21,8 @@ cargo add nyxstone-tricore-gcc-ipc    # MIT, IPC daemon, ~150 k ops/s
 pip install nyxstone-tricore-gcc
 ```
 
-Supported prebuilts: `x86_64-linux-gnu`, `aarch64-linux-gnu`.  Other hosts
+Supported prebuilts: `x86_64-linux-gnu`, `aarch64-linux-gnu`, `aarch64-apple-darwin`
+(Apple silicon).  Other hosts
 build binutils-tricore from source automatically (see *Binutils provisioning*
 below).
 
@@ -93,8 +94,8 @@ C++ or Python too, use the Rust MIT crate via a thin FFI or open an issue.
 ## Quick start
 
 `make` Just Works™, it auto-extracts the committed binutils prebuilts
-(`third_party/binutils-tricore-prebuilt/`, ~3 MB across x86_64+aarch64,
-nopic+pic) on first run, no network access needed:
+(`third_party/binutils-tricore-prebuilt/`, ~4 MB across x86_64 Linux, aarch64
+Linux and Apple silicon, nopic+pic) on first run, no network access needed:
 
 ```sh
 # 1. Build the C++ library + tests + examples (~5 s on first run).
@@ -138,7 +139,7 @@ NYX_BINUTILS_PIC=1 make
 
 | source | trigger | time |
 |---|---|---|
-| **prebuilt** (default, x86_64 / aarch64 Linux) | `make` extracts `third_party/binutils-tricore-prebuilt/$(uname -m)-linux-gnu/{nopic,pic}/lib.tar.xz` automatically | **~1 s** |
+| **prebuilt** (default, x86_64 / aarch64 Linux, Apple silicon macOS) | `make` extracts `third_party/binutils-tricore-prebuilt/<host>/{nopic,pic}/lib.tar.xz` automatically | **~1 s** |
 | **from source** (other arches, or `make fetch_binutils`) | `scripts/fetch_binutils.sh`, clone emproof-com fork, configure, build, stage | **~75 s** |
 
 Override the binutils tree wholesale with `make NYX_BINUTILS=/path/to/tree`.
@@ -348,10 +349,11 @@ NyxstoneTricoreGCC/
 │   └── python/                    setuptools + CFFI extension
 ├── scripts/
 │   ├── fetch_binutils.sh          Clone + build binutils from source
-│   ├── build_prebuilts.sh         Refresh all 4 prebuilt tarball variants
+│   ├── build_prebuilts.sh         Refresh the 4 Linux prebuilt tarball variants
+│   ├── build_prebuilt_macos.sh    Build the Apple silicon prebuilt natively (CI: prebuilts-macos)
 │   └── extract_prebuilt.sh        Extract host-matching prebuilt into third_party/
 ├── third_party/
-│   ├── binutils-tricore-prebuilt/ Committed prebuilts (~3 MB compressed)
+│   ├── binutils-tricore-prebuilt/ Committed prebuilts (~4 MB compressed)
 │   └── binutils-tricore/          Extracted-on-demand working tree (gitignored)
 ├── docs/architecture.md           How the library is plumbed together
 ├── Makefile                       Simple build
