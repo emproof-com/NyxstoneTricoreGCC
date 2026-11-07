@@ -1,19 +1,24 @@
 # Builds the aarch64-apple-darwin prebuilt of binutils-tricore natively on a
 # hosted Apple silicon runner (free for a public repository), tests every
 # surface of the library against it, and uploads the tarballs as an artifact.
-# To refresh the committed prebuilt (after a bump of BINUTILS_COMMIT or a
-# change of the recipe), put the artifact's files under
-# third_party/binutils-tricore-prebuilt/aarch64-apple-darwin/ and commit.
+# On the macos-prebuilts branch it also commits the tarballs back, which
+# refreshes the committed prebuilt without a download (a push with the
+# workflow token starts no new run).  To refresh after a bump of
+# BINUTILS_COMMIT or a change of the recipe: push the change to that branch,
+# or run the workflow by hand and commit the artifact's files under
+# third_party/binutils-tricore-prebuilt/aarch64-apple-darwin/.
+#
+# macos-14 was retired on 2026-11-02; macos-15 is the Apple silicon image.
 name: prebuilts-macos
 on:
   workflow_dispatch:
   push:
     branches: [macos-prebuilts]
 permissions:
-  contents: read
+  contents: write
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -53,3 +58,13 @@ jobs:
           name: binutils-tricore-prebuilt-aarch64-apple-darwin
           path: third_party/binutils-tricore-prebuilt/aarch64-apple-darwin
           if-no-files-found: error
+
+      - name: Commit the tarballs back to the branch
+        if: github.event_name == 'push' && github.ref == 'refs/heads/macos-prebuilts'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add third_party/binutils-tricore-prebuilt/aarch64-apple-darwin
+          git diff --quiet --staged && { echo "prebuilt unchanged"; exit 0; }
+          git commit -m "Refresh the aarch64-apple-darwin prebuilt (built on ${RUNNER_OS} ${ImageOS:-}, run ${GITHUB_RUN_ID})"
+          git push

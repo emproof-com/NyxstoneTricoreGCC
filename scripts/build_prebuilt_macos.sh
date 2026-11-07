@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the aarch64-apple-darwin prebuilt of binutils-tricore natively on an
 # Apple silicon Mac and stage it into third_party/binutils-tricore-prebuilt/.
-# .github/workflows/prebuilts-macos.yml runs it on a hosted macos-14 runner
+# .github/workflows/prebuilts-macos.yml runs it on a hosted macos-15 runner
 # (free for a public repository); a developer with a Mac can run it directly.
 #
 # Differences from the Linux build (scripts/build_prebuilts.sh):
