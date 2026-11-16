@@ -47,8 +47,12 @@ method that fits how your program is distributed.
 For anything you ship (a product, a CLI, a CI/container image), **bundle
 `nyxstone-tcd` with your executable**.  Do **not** rely on a runtime
 `cargo install` — a minimal container usually has neither `cargo` nor network,
-so it fails.  The daemon must be the **matching crate version** (protocols are
-version-locked).  It is found automatically if you put it in any of:
+so it fails.  The daemon must be the **same crate version** as the client: the
+daemon sends its version in the handshake, and the client refuses a different
+one (`NyxstoneTricoreGCC::new()` returns an error that names both versions).
+The output bytes can change between releases, thus a daemon of a different
+release is never used.  The daemon is found automatically if you put it in any
+of:
 
 ```sh
 # 1. next to your binary (zero config -- found via the executable's directory)

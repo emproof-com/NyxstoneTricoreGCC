@@ -16,12 +16,22 @@
 //! ```
 //!
 //! For responses, `opcode` is replaced by `status` (0 = ok, else error code).
-//! Both sides validate `PROTOCOL_VERSION` once during the connection handshake.
+//! The connection handshake carries `PROTOCOL_VERSION` and the crate version of
+//! the daemon.  The client refuses a daemon with a different value of either:
+//! the output bytes can change between releases with no change of the wire
+//! format, thus the wire format version alone does not pair the two.
 
 use std::io::{self, Read, Write};
 
 /// Bumped whenever the wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Version of this crate.  The daemon must report the same version in the
+/// handshake (the two crates are released together with one version).
+pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Upper limit for the length of the version string in the handshake.
+const MAX_VERSION_LEN: u32 = 64;
 
 /// Hard cap on a frame body (and on any single length-prefixed string or
 /// byte buffer inside one): 64 MiB.
@@ -150,12 +160,18 @@ impl FrameHeader {
     }
 }
 
-/// Handshake bytes the daemon sends on connect.  Verifies protocol version.
-pub fn write_handshake(w: &mut impl Write) -> io::Result<()> {
+/// Writes the handshake that the daemon sends on connect: the magic, the
+/// wire format version and `crate_version`, the version of the daemon crate
+/// (not of this crate: the daemon can be built against a different release
+/// of it).
+pub fn write_handshake(w: &mut impl Write, crate_version: &str) -> io::Result<()> {
     w.write_all(&HANDSHAKE_MAGIC)?;
-    write_u32(w, PROTOCOL_VERSION)
+    write_u32(w, PROTOCOL_VERSION)?;
+    write_str(w, crate_version)
 }
 
+/// Reads the handshake of the daemon and makes sure that its wire format
+/// version and its crate version are equal to those of this client.
 pub fn read_handshake(r: &mut impl Read) -> io::Result<()> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic)?;
@@ -166,7 +182,21 @@ pub fn read_handshake(r: &mut impl Read) -> io::Result<()> {
     let ver = read_u32(r)?;
     if ver != PROTOCOL_VERSION {
         return Err(io::Error::new(io::ErrorKind::InvalidData,
-            format!("protocol version mismatch: daemon {ver}, client {PROTOCOL_VERSION}")));
+            format!("protocol version mismatch: daemon {ver}, client {PROTOCOL_VERSION} \
+                     (the client needs nyxstone-tcd {CRATE_VERSION})")));
+    }
+    let len = read_u32(r)?;
+    if len > MAX_VERSION_LEN {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("handshake version string of {len} bytes")));
+    }
+    let mut raw = vec![0u8; len as usize];
+    r.read_exact(&mut raw)?;
+    let daemon_version = String::from_utf8_lossy(&raw);
+    if daemon_version != CRATE_VERSION {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("version mismatch: nyxstone-tcd is {daemon_version}, the client \
+                     is {CRATE_VERSION}; install nyxstone-tricore-gcc@{CRATE_VERSION}")));
     }
     Ok(())
 }
@@ -373,6 +403,42 @@ pub fn read_relocations(r: &mut &[u8]) -> io::Result<Vec<WireRelocation>> {
 
 #[cfg(test)]
 mod tests {
+    fn handshake_error(daemon_bytes: &[u8]) -> String {
+        read_handshake(&mut &daemon_bytes[..]).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn handshake_accepts_the_same_crate_version() {
+        let mut buf = Vec::new();
+        write_handshake(&mut buf, CRATE_VERSION).unwrap();
+        read_handshake(&mut &buf[..]).unwrap();
+    }
+
+    #[test]
+    fn handshake_refuses_a_different_crate_version() {
+        let mut buf = Vec::new();
+        write_handshake(&mut buf, "0.0.0-other").unwrap();
+        let msg = handshake_error(&buf);
+        assert!(msg.contains("0.0.0-other") && msg.contains(CRATE_VERSION), "{msg}");
+    }
+
+    #[test]
+    fn handshake_refuses_the_version_1_daemon() {
+        // A daemon up to 0.2.3 sends the magic and the version 1, no string.
+        let mut buf = HANDSHAKE_MAGIC.to_vec();
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        let msg = handshake_error(&buf);
+        assert!(msg.contains("protocol version mismatch"), "{msg}");
+    }
+
+    #[test]
+    fn handshake_refuses_an_oversized_version_string() {
+        let mut buf = HANDSHAKE_MAGIC.to_vec();
+        buf.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(handshake_error(&buf).contains("version string"));
+    }
+
     use super::*;
 
     #[test]
