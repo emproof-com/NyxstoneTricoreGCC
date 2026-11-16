@@ -50,6 +50,10 @@ void   nyxstone_glue_set_sym (const char *name, const char *value_expr);
 void   nyxstone_glue_fb_label (unsigned int n);
 void   nyxstone_glue_md_assemble (char *line);
 void   nyxstone_glue_emit_bytes (const uint8_t *p, size_t n);
+void   nyxstone_glue_emit_fill (uint64_t n, int fill);
+int    nyxstone_glue_had_fatal (void);
+size_t nyxstone_glue_insn_count (void);
+void   nyxstone_glue_insn_range (size_t i, uint64_t *offset, uint64_t *size);
 void   nyxstone_glue_emit_cons (const char *args, int nbytes);
 void   nyxstone_glue_align (unsigned int p2, int fill, unsigned int max);
 void   nyxstone_glue_org (uint64_t target, int fill);
@@ -102,13 +106,30 @@ inline void rtrim(std::string& s) {
     while (i > 0 && std::isspace(static_cast<unsigned char>(s[i-1]))) --i;
     s.resize(i);
 }
-// Remove /* ... */ block comments from the whole source before tokenizing.
-// gas's input scrubber (app.c) does this; NyxstoneTricoreGCC parses the source
+// Value of the character after a backslash for the escapes that have one
+// fixed value (gas: process_escape in app.c, next_char_of_string in read.c).
+// Each other character stands for itself.
+inline unsigned char simple_escape(char c) {
+    switch (c) {
+        case 'b': return 8;
+        case 'f': return 12;
+        case 'n': return 10;
+        case 'r': return 13;
+        case 't': return 9;
+        case 'v': return 11;
+        default:  return static_cast<unsigned char>(c);
+    }
+}
+
+// Remove /* ... */ block comments from the whole source before tokenizing,
+// and replace each character literal ('x', '\n') by its decimal value.
+// gas's input scrubber (app.c) does both; NyxstoneTricoreGCC parses the source
 // itself and never runs the scrubber, so we replicate it.  Quote-aware: a
 // "..." string literal is copied verbatim.  Each comment (including multi-line
 // ones, which would otherwise be split across statements) becomes a single
 // space so it cannot fuse adjacent tokens.  An unterminated comment is dropped
-// to end of input, matching gas.
+// to end of input, matching gas.  The character literal goes first because
+// its character can be a comment or separator character (`.byte '#'`).
 std::string strip_block_comments(const std::string& src) {
     std::string out;
     out.reserve(src.size());
@@ -122,6 +143,14 @@ std::string strip_block_comments(const std::string& src) {
             continue;
         }
         if (c == '"') { in_str = true; out.push_back(c); continue; }
+        if (c == '\'' && i + 1 < src.size() && src[i + 1] != '\n') {
+            unsigned char v = static_cast<unsigned char>(src[++i]);
+            if (v == '\\' && i + 1 < src.size() && src[i + 1] != '\n')
+                v = simple_escape(src[++i]);
+            out += std::to_string(static_cast<int>(v));
+            if (i + 1 < src.size() && src[i + 1] == '\'') ++i;   // closing quote
+            continue;
+        }
         if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') {
             i += 2;
             while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
@@ -271,17 +300,31 @@ void emit_ascii(const std::string& d, const std::string& args, bool zero_term) {
         std::string out;
         while (p < end && *p != '"') {
             if (*p == '\\' && p + 1 < end) {
+                // The escapes of gas (next_char_of_string in read.c): up to
+                // three octal digits, `x` with hex digits (the low 8 bits
+                // count), and the single-character escapes.
                 ++p;
-                switch (*p) {
-                    case 'n': out += '\n'; break;
-                    case 't': out += '\t'; break;
-                    case 'r': out += '\r'; break;
-                    case '0': out += '\0'; break;
-                    case '\\': out += '\\'; break;
-                    case '"': out += '"'; break;
-                    default: out += *p; break;
+                if (*p >= '0' && *p <= '7') {
+                    unsigned v = 0;
+                    for (int k = 0; k < 3 && p < end && *p >= '0' && *p <= '7'; ++k)
+                        v = v * 8 + static_cast<unsigned>(*p++ - '0');
+                    out += static_cast<char>(v & 0xff);
+                } else if (*p == 'x' || *p == 'X') {
+                    ++p;
+                    unsigned v = 0;
+                    while (p < end && std::isxdigit(static_cast<unsigned char>(*p))) {
+                        char h = *p++;
+                        v = (v * 16 + static_cast<unsigned>(
+                                 std::isdigit(static_cast<unsigned char>(h))
+                                     ? h - '0'
+                                     : std::tolower(static_cast<unsigned char>(h)) - 'a' + 10))
+                            & 0xff;
+                    }
+                    out += static_cast<char>(v);
+                } else {
+                    out += static_cast<char>(simple_escape(*p));
+                    ++p;
                 }
-                ++p;
             } else {
                 out += *p++;
             }
@@ -330,11 +373,8 @@ bool handle_directive(const std::string& line) {
         int n_args = parse_int_args(args, vals, (d == ".zero") ? 1 : 2);
         if (n_args < 1) { directive_error(d + ": expected a size operand, got '" + args + "'"); return true; }
         if (vals[0] < 0) { directive_error(d + ": negative size"); return true; }
-        if (vals[0] > 0) {
-            std::vector<uint8_t> fill(static_cast<size_t>(vals[0]),
-                                      static_cast<uint8_t>(vals[1]));
-            nyxstone_glue_emit_bytes(fill.data(), fill.size());
-        }
+        nyxstone_glue_emit_fill(static_cast<uint64_t>(vals[0]),
+                                static_cast<uint8_t>(vals[1]));
         return true;
     }
     if (d == ".org") {
@@ -445,9 +485,12 @@ bool handle_directive(const std::string& line) {
 struct AssembleCore {
     std::vector<uint8_t> bytes;
     std::vector<RelocationInfo> relocations;
+    // Offset in `bytes` and size of each instruction statement, in source
+    // order.  Data directives and padding have no entry.
+    std::vector<std::pair<size_t, size_t>> insn_ranges;
 };
 
-tl::expected<AssembleCore, std::string> do_assemble(
+tl::expected<AssembleCore, std::string> do_assemble_unguarded(
     const std::string& source,
     uint64_t address,
     const std::vector<NyxstoneTricoreGCC::LabelDefinition>& labels,
@@ -545,6 +588,12 @@ tl::expected<AssembleCore, std::string> do_assemble(
 
     const std::string diag = clean_gas_diag(nyxstone_glue_end_capture());
 
+    // gas hit a fatal error (as_fatal, as_abort, out of memory).  The glue
+    // stopped the exit of the process; the state of this call is not usable.
+    if (nyxstone_glue_had_fatal())
+        return tl::make_unexpected(
+            "assemble: " + (diag.empty() ? std::string("gas fatal error") : diag));
+
     if (!g_directive_error.empty())
         return tl::make_unexpected("assemble: " + g_directive_error);
     if (g_section_violation)
@@ -592,6 +641,16 @@ tl::expected<AssembleCore, std::string> do_assemble(
     result.bytes.resize(n);
     if (n) nyxstone_glue_extract_text_bytes(result.bytes.data(), n);
 
+    const size_t n_insns = nyxstone_glue_insn_count();
+    result.insn_ranges.reserve(n_insns);
+    for (size_t i = 0; i < n_insns; ++i) {
+        uint64_t off = 0, size = 0;
+        nyxstone_glue_insn_range(i, &off, &size);
+        if (size == 0 || off > n || size > n - off) continue;
+        result.insn_ranges.emplace_back(static_cast<size_t>(off),
+                                        static_cast<size_t>(size));
+    }
+
     if (with_relocs) {
         size_t count = nyxstone_glue_collect_relocs(nullptr, 0);
         if (count) {
@@ -621,6 +680,22 @@ tl::expected<AssembleCore, std::string> do_assemble(
         }
     }
     return result;
+}
+
+// Exception barrier of do_assemble_unguarded: an allocation failure becomes
+// an error value, and the stderr capture always ends.
+tl::expected<AssembleCore, std::string> do_assemble(
+    const std::string& source,
+    uint64_t address,
+    const std::vector<NyxstoneTricoreGCC::LabelDefinition>& labels,
+    bool with_relocs)
+{
+    try {
+        return do_assemble_unguarded(source, address, labels, with_relocs);
+    } catch (const std::exception& e) {
+        nyxstone_glue_end_capture();
+        return tl::make_unexpected(std::string("assemble: ") + e.what());
+    }
 }
 
 // ---- core disassemble: returns instructions or an error string ----------
@@ -656,6 +731,26 @@ tl::expected<std::vector<NyxstoneTricoreGCC::Instruction>, std::string> do_disas
     return out;
 }
 
+// Builds the instruction list of an assemble result from the instruction
+// records.  A decode of the whole byte stream would read data directives
+// (`.word`, `.asciz`, padding) as instructions and could lose a real
+// instruction that follows them.
+tl::expected<std::vector<NyxstoneTricoreGCC::Instruction>, std::string> instructions_of(
+    const AssembleCore& core,
+    uint64_t address)
+{
+    std::vector<NyxstoneTricoreGCC::Instruction> out;
+    out.reserve(core.insn_ranges.size());
+    for (const auto& range : core.insn_ranges) {
+        const auto first = core.bytes.begin() + static_cast<std::ptrdiff_t>(range.first);
+        const std::vector<uint8_t> slice(first, first + static_cast<std::ptrdiff_t>(range.second));
+        auto insns = do_disassemble(slice, address + range.first, 0);
+        if (!insns) return tl::make_unexpected(insns.error());
+        for (auto& i : *insns) out.push_back(std::move(i));
+    }
+    return out;
+}
+
 }  // namespace
 
 // =============================================================================
@@ -687,7 +782,7 @@ NyxstoneTricoreGCC::assemble_to_instructions(
 {
     auto r = do_assemble(assembly, address, labels, /*with_relocs=*/false);
     if (!r) return tl::make_unexpected(r.error());
-    return do_disassemble(r->bytes, address, 0);
+    return instructions_of(*r, address);
 }
 
 tl::expected<NyxstoneTricoreGCC::AssembleWithRelocsResult, std::string>
@@ -712,7 +807,7 @@ NyxstoneTricoreGCC::assemble_to_instructions_with_relocs(
 {
     auto r = do_assemble(assembly, address, labels, /*with_relocs=*/true);
     if (!r) return tl::make_unexpected(r.error());
-    auto insns = do_disassemble(r->bytes, address, 0);
+    auto insns = instructions_of(*r, address);
     if (!insns) return tl::make_unexpected(insns.error());
     AssembleInstructionsWithRelocsResult out;
     out.instructions = std::move(*insns);
