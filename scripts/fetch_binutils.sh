@@ -3,21 +3,31 @@
 # known commit, then stage the artifacts NyxstoneTricoreGCC needs into
 # third_party/binutils-tricore/.
 #
+# The commit is the one in third_party/binutils-tricore-prebuilt/BINUTILS_COMMIT
+# (the commit of the committed prebuilts), thus a source build and a prebuilt
+# give the same assembler.  NYX_BINUTILS_REF selects a different commit, branch
+# or tag.
+#
 # Usage:
 #   scripts/fetch_binutils.sh                    # clone fresh, build, stage
+#   NYX_BINUTILS_REF=master scripts/fetch_binutils.sh
+#                                                # build a different ref
 #   NYX_BINUTILS_SRC=/path/to/src scripts/fetch_binutils.sh
 #                                                # use an existing source tree
 #   NYX_BINUTILS_BUILD=/path/to/build scripts/fetch_binutils.sh
 #                                                # use an existing build tree
+#   NYX_BINUTILS_OUT=/path/to/tree scripts/fetch_binutils.sh
+#                                                # stage into a different tree
 #
 # Side effect: writes ~25 MB into third_party/binutils-tricore/.
 
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")"/.. && pwd)"
-TP="$HERE/third_party/binutils-tricore"
+TP="${NYX_BINUTILS_OUT:-$HERE/third_party/binutils-tricore}"
 
 FORK_URL="${NYX_BINUTILS_URL:-https://github.com/emproof-com/tricore-binutils-gdb.git}"
-FORK_REF="${NYX_BINUTILS_REF:-master}"
+PINNED_REF="$(tr -d '[:space:]' < "$HERE/third_party/binutils-tricore-prebuilt/BINUTILS_COMMIT")"
+FORK_REF="${NYX_BINUTILS_REF:-$PINNED_REF}"
 
 # Set NYX_BINUTILS_PIC=1 to build binutils with -fPIC.  Required if you want
 # to build NyxstoneTricoreGCC as a shared library (e.g. for Python ctypes).
@@ -37,7 +47,12 @@ PREFIX="$WORK/binutils-install"
 
 if [[ ! -d "$SRC" ]]; then
     echo ">>> Cloning $FORK_URL @ $FORK_REF into $SRC"
-    git clone --depth=1 --branch "$FORK_REF" "$FORK_URL" "$SRC"
+    # `git clone --branch` takes no commit hash; fetch the ref into a new
+    # repository (the hash, a branch and a tag all work).
+    git init --quiet "$SRC"
+    git -C "$SRC" fetch --quiet --depth=1 "$FORK_URL" "$FORK_REF"
+    git -C "$SRC" -c advice.detachedHead=false checkout --quiet FETCH_HEAD
+    echo ">>> Source is at $(git -C "$SRC" rev-parse HEAD)"
 fi
 
 if [[ ! -d "$BUILD/gas" ]]; then

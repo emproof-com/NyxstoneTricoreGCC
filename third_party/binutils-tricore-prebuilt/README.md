@@ -75,9 +75,24 @@ tarballs back on the `macos-prebuilts` branch.  Its `config.h` differs from the
 Linux ones (no zstd, Apple libc), the gas objects are Mach-O, and `as_renamed.o`
 got its `main` renamed by `-Dmain=gas_main` (macOS has no objcopy).
 
-CI should additionally run a verification job: rebuild from
-`BINUTILS_COMMIT` and `diff` against the committed tarballs to catch
-accidental drift.
+## Verification
+
+The `verify-prebuilt` CI job runs
+[`scripts/verify_prebuilt.sh`](../../scripts/verify_prebuilt.sh) for the Linux
+x86-64 prebuilt.  The script builds the commit in `BINUTILS_COMMIT` from source
+and makes sure that:
+
+- each committed header is byte-identical to the header of the source build
+  (`config.h` is excluded: it records the host features);
+- the committed tree has the same object files and archives, and each one
+  defines the same global symbols;
+- the test suite, with its byte-exact reference corpora, passes against the
+  source build.
+
+A byte comparison of the objects is not possible: the object code changes with
+the compiler version.  [`scripts/fetch_binutils.sh`](../../scripts/fetch_binutils.sh)
+builds the commit in `BINUTILS_COMMIT` by default, thus a source build and a
+prebuilt give the same assembler.
 
 ## Why per-arch `headers-arch.tar.xz`?
 
