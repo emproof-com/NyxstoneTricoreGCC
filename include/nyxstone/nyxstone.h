@@ -135,6 +135,11 @@ public:
     /// @brief Translates assembly instructions at given start address to
     /// instruction details containing bytes.
     ///
+    /// The result has one record for each instruction, in source order.  Data
+    /// in the text (`.word`, `.asciz`, the padding of `.align`/`.org`) has no
+    /// record, thus the addresses of the records can have gaps.  Use
+    /// @ref assemble for the complete byte stream.
+    ///
     /// @param assembly The assembly instruction(s) to be assembled.
     /// @param address  The absolute address of the first instruction.
     /// @param labels   External label definitions used by @p assembly.

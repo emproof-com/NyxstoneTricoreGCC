@@ -39,7 +39,7 @@ same argument order (`source` / `bytes`, `address`, then either `labels` or
 | method | purpose |
 |---|---|
 | `assemble` | bytes only, labels resolved inline |
-| `assemble_to_instructions` | per-insn records, labels resolved inline |
+| `assemble_to_instructions` | per-insn records (instructions only, no data), labels resolved inline |
 | `assemble_with_relocs` | bytes + relocations (gcc/gas `-r` equivalent) |
 | `assemble_to_instructions_with_relocs` | per-insn records + relocations |
 | `disassemble` | bytes → text |
@@ -64,6 +64,17 @@ same argument order (`source` / `bytes`, `address`, then either `labels` or
   variants are the link-later path: undefined references are *not* an error
   there -- each one comes back as a relocation record (zero placeholder bytes
   + `R_TRICORE_*` entry, gas `-r` style) for the linker to resolve.
+- **Instruction records are instructions.** `assemble_to_instructions*`
+  returns one record per instruction that gas emitted.  Data in the text
+  (`.word`, `.asciz`, padding of `.align`/`.org`) is in the bytes of
+  `assemble`, but it has no record: it is not decoded as an instruction.
+- **Size limit.** The assembled section can have 64 MiB at most (the frame
+  limit of the daemon protocol).  A larger `.skip`/`.org`/`.align` is an
+  error.  A fatal gas error (`as_fatal`, out of memory) is also returned as
+  an error; it does not end the host process.
+- **Symbol differences.** `.word b - a` works when both symbols are defined
+  in the source (or as a `LabelDefinition`).  A difference with an undefined
+  symbol is an error in all paths: no TriCore relocation can hold it.
 
 ## License modes
 
@@ -349,7 +360,8 @@ NyxstoneTricoreGCC/
 │   ├── rust-ipc/                  nyxstone-tricore-gcc-ipc (MIT) IPC client crate
 │   └── python/                    setuptools + CFFI extension
 ├── scripts/
-│   ├── fetch_binutils.sh          Clone + build binutils from source
+│   ├── fetch_binutils.sh          Clone + build binutils from source (the commit in BINUTILS_COMMIT)
+│   ├── verify_prebuilt.sh         Compare the committed prebuilt with a source build (CI: verify-prebuilt)
 │   ├── build_prebuilts.sh         Refresh the 4 Linux prebuilt tarball variants
 │   ├── build_prebuilt_macos.sh    Build the Apple silicon prebuilt natively (CI: prebuilts-macos)
 │   └── extract_prebuilt.sh        Extract host-matching prebuilt into third_party/
@@ -396,7 +408,7 @@ NyxstoneTricoreGCC/
   out-of-range immediates -- all must reject instead of emitting silently
   wrong bytes.
 
-After the core matrix, post-matrix checks (787 assertions) cover:
+After the core matrix, post-matrix checks (824 assertions) cover:
 
 - 100× stress per test catches state-reset drift across consecutive
   `assemble()` calls.
@@ -495,7 +507,7 @@ $ ./run_tests
   590 branch-relax pass, 0 fail (590 sources x 2 addresses)
 Summary: 170 passed, 0 failed, 0 drifts (of 170 tests);
          136 disasm round-trips passed, 0 failed;
-         787 additional API checks passed, 0 failed
+         824 additional API checks passed, 0 failed
 ```
 
 ## Threading

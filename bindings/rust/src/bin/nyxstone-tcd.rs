@@ -66,7 +66,9 @@ fn main() {
 fn serve(mut r: impl Read, mut w: impl Write, nyx: &NyxstoneTricoreGCC)
     -> std::io::Result<()>
 {
-    p::write_handshake(&mut w)?;
+    // The version of this (daemon) crate: the client refuses a daemon of a
+    // different release, whose output bytes can differ.
+    p::write_handshake(&mut w, env!("CARGO_PKG_VERSION"))?;
     w.flush()?;
     loop {
         // Read one raw frame.  EOF = client closed socket → graceful exit.

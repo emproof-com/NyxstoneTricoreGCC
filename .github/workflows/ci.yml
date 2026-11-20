@@ -49,6 +49,23 @@ jobs:
           python3 setup.py build_ext --inplace
           PYTHONPATH=. python3 examples/smoke.py
 
+  # Makes sure that the committed Linux x86-64 prebuilt comes from the fork
+  # commit in BINUTILS_COMMIT: a source build of that commit must have the
+  # same headers and global symbols, and must pass the test suite.
+  verify-prebuilt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build dependencies of binutils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bison flex texinfo zlib1g-dev libzstd-dev
+
+      - name: Compare the prebuilt with a source build of BINUTILS_COMMIT
+        run: scripts/verify_prebuilt.sh
+
   test-macos:
     runs-on: macos-15
     steps:

@@ -43,6 +43,7 @@ extern void     symbol_begin (void);
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include <setjmp.h>
 
 extern void md_begin (void);
 extern int  md_parse_option (int c, const char *arg);
@@ -67,6 +68,72 @@ extern const relax_typeS md_relax_table[];
 extern int    print_insn_tricore (unsigned long, struct disassemble_info *);
 
 static int g_initialized = 0;
+
+/* Upper limit for the size of the assembled section.  It is equal to the
+   frame limit of the daemon protocol (MAX_FRAME in bindings/rust-ipc).  A
+   directive with a larger size (`.skip`, `.org`, `.align`) is an error: gas
+   counts a frag in `int`, and the host must not allocate gigabytes because
+   of one source line. */
+#ifndef NYX_MAX_TEXT_BYTES
+#define NYX_MAX_TEXT_BYTES ((size_t) 64 * 1024 * 1024)
+#endif
+
+/* Bytes that the size directives added in this call (limit check before the
+   allocation).  The final layout makes the check for the whole section. */
+static size_t g_fill_bytes = 0;
+
+/* ----- gas fatal errors -------------------------------------------------- */
+/* as_fatal, as_abort and a failed xmalloc end in libiberty's xexit, which
+   calls `_xexit_cleanup` and then exit().  A library must not end the host
+   process.  The hook below jumps back into the glue function that called gas;
+   that function returns, and each later glue call of the same assemble does
+   nothing.  The C++ layer reads nyxstone_glue_had_fatal() and returns the
+   captured text as an error.  Memory that gas or the glue function held at
+   the jump is not released (the next reset drops the gas obstacks). */
+extern void (*_xexit_cleanup) (void);
+static jmp_buf g_fatal_jmp;
+static int     g_fatal_armed = 0;
+static int     g_fatal       = 0;
+
+static void fatal_hook (void)
+{
+    if (!g_fatal_armed) return;      /* not inside a glue call: let it exit */
+    g_fatal_armed = 0;
+    g_fatal       = 1;
+    _longjmp (g_fatal_jmp, 1);
+}
+
+/* Each glue function that calls gas starts with GAS_ENTER and ends with
+   GAS_LEAVE.  `ret` is the value to return after a fatal error.  _setjmp
+   does not save the signal mask: setjmp on macOS does, with a system call
+   for each source line. */
+#define GAS_ENTER(ret)                                   \
+    do {                                                 \
+        if (g_fatal) return ret;                         \
+        g_fatal_armed = 1;                               \
+        if (_setjmp (g_fatal_jmp)) return ret;           \
+    } while (0)
+#define GAS_LEAVE() (g_fatal_armed = 0)
+
+int nyxstone_glue_had_fatal (void)
+{
+    return g_fatal;
+}
+
+/* ----- instruction records ---------------------------------------------- */
+/* Position of each instruction that md_assemble emitted: a (frag, offset)
+   pair for its start and for its end.  The final address of a position is
+   fr_address + offset, which is correct after relaxation because a relaxed
+   instruction is the variable part at the end of its frag.  The list lets
+   assemble_to_instructions return the instructions only; data directives in
+   the text are not decoded as instructions. */
+typedef struct {
+    fragS *start_frag; size_t start_off;
+    fragS *end_frag;   size_t end_off;
+} insn_mark_t;
+static insn_mark_t *g_marks     = NULL;
+static size_t       g_marks_len = 0;
+static size_t       g_marks_cap = 0;
 
 /* ----- gas stderr capture ----------------------------------------------- */
 /* gas reports every diagnostic through as_bad/as_warn, which print to the
@@ -186,6 +253,10 @@ int nyxstone_glue_init_once (void)
     bfd_make_writable (stdoutput);
     bfd_set_format (stdoutput, bfd_object);
     bfd_set_arch_mach (stdoutput, bfd_arch_tricore, 0);
+    /* `.` (the current location) is this symbol; without the init an
+       expression with `.` reads a symbol that has no name and no bfd part. */
+    dot_symbol_init ();
+    _xexit_cleanup = fatal_hook;
 
     text_section = subseg_new (".text", 0);
     data_section = subseg_new (".data", 0);
@@ -235,6 +306,10 @@ static void reset_section (segT seg)
 
 void nyxstone_glue_reset (void)
 {
+    g_fatal       = 0;
+    g_fatal_armed = 0;
+    g_fill_bytes  = 0;
+    g_marks_len   = 0;
     symbol_end ();
     symbol_begin ();
     reset_section (text_section);
@@ -256,7 +331,9 @@ void nyxstone_glue_reset (void)
 /* ----- 3. Forwarders into gas ------------------------------------------ */
 void nyxstone_glue_colon (const char *name)
 {
+    GAS_ENTER ();
     colon (name);
+    GAS_LEAVE ();
 }
 
 /* Define `name` as an absolute symbol holding the full target address.
@@ -273,20 +350,22 @@ void nyxstone_glue_colon (const char *name)
    PC-relative refs as value - (base + PC) and absolute refs as the value. */
 void nyxstone_glue_define_abs (const char *name, uint64_t value)
 {
+    GAS_ENTER ();
     symbolS *sym = symbol_find (name);
     if (sym) {
         if (S_IS_DEFINED (sym)) {
             as_bad ("label '%s' is defined both in the source and as a "
                     "LabelDefinition", name);
-            return;
+        } else {
+            S_SET_SEGMENT (sym, absolute_section);
+            S_SET_VALUE (sym, (valueT) value);
         }
-        S_SET_SEGMENT (sym, absolute_section);
-        S_SET_VALUE (sym, (valueT) value);
     } else {
         sym = symbol_new (name, absolute_section,
                           &zero_address_frag, (valueT) value);
         symbol_table_insert (sym);
     }
+    GAS_LEAVE ();
 }
 
 /* `.equ name, expr` / `.set name, expr`: route through gas's own `equals`
@@ -305,10 +384,12 @@ void nyxstone_glue_set_sym (const char *name, const char *value_expr)
     vbuf[vlen + 1] = '\n';
     vbuf[vlen + 2] = '\0';
 
+    GAS_ENTER ();
     char *saved = input_line_pointer;
     input_line_pointer = vbuf;
     equals (nbuf, 1 /* allow reassignment, .set semantics */);
     input_line_pointer = saved;
+    GAS_LEAVE ();
     free (nbuf);
     free (vbuf);
 }
@@ -319,20 +400,86 @@ void nyxstone_glue_set_sym (const char *name, const char *value_expr)
    by gas's expression parser against the same counter (expr.c). */
 void nyxstone_glue_fb_label (unsigned int n)
 {
+    GAS_ENTER ();
     fb_label_instance_inc (n);
     colon (fb_label_name (n, 0));
+    GAS_LEAVE ();
 }
 
 void nyxstone_glue_md_assemble (char *line)
 {
+    GAS_ENTER ();
+    if (g_marks_len == g_marks_cap) {
+        size_t nc = g_marks_cap ? g_marks_cap * 2 : 64;
+        insn_mark_t *nm = (insn_mark_t *) realloc (g_marks, nc * sizeof (*nm));
+        if (!nm) { as_bad ("out of memory"); GAS_LEAVE (); return; }
+        g_marks     = nm;
+        g_marks_cap = nc;
+    }
+    /* Static storage: an automatic variable that changes after setjmp is
+       indeterminate after the longjmp. */
+    static insn_mark_t m;
+    m.start_frag = frag_now;
+    m.start_off  = (size_t) frag_now_fix ();
     md_assemble (line);
+    m.end_frag = frag_now;
+    m.end_off  = (size_t) frag_now_fix ();
+    g_marks[g_marks_len++] = m;
+    GAS_LEAVE ();
+}
+
+/* Number of instruction records of the last assemble. */
+size_t nyxstone_glue_insn_count (void)
+{
+    return g_marks_len;
+}
+
+/* Section-relative offset and byte size of instruction record `i`.  Valid
+   after nyxstone_glue_resolve_text_fixups (final layout). */
+void nyxstone_glue_insn_range (size_t i, uint64_t *offset, uint64_t *size)
+{
+    const insn_mark_t *m = &g_marks[i];
+    uint64_t start = (uint64_t) m->start_frag->fr_address + m->start_off;
+    uint64_t end   = (uint64_t) m->end_frag->fr_address   + m->end_off;
+    *offset = start;
+    *size   = end > start ? end - start : 0;
+}
+
+/* Makes sure that `n` more bytes of a size directive fit below the limit.
+   Raises a gas error and returns 0 if they do not. */
+static int reserve_fill_bytes (uint64_t n)
+{
+    if (n > NYX_MAX_TEXT_BYTES - g_fill_bytes) {
+        as_bad ("the section is larger than the limit of %lu bytes",
+                (unsigned long) NYX_MAX_TEXT_BYTES);
+        return 0;
+    }
+    g_fill_bytes += (size_t) n;
+    return 1;
 }
 
 void nyxstone_glue_emit_bytes (const uint8_t *p, size_t n)
 {
     if (!n) return;
-    char *dst = frag_more ((int) n);
-    memcpy (dst, p, n);
+    GAS_ENTER ();
+    if (reserve_fill_bytes (n)) {
+        char *dst = frag_more (n);
+        memcpy (dst, p, n);
+    }
+    GAS_LEAVE ();
+}
+
+/* `.skip`/`.space`/`.zero`: `n` bytes of `fill`.  The limit check comes
+   before the allocation. */
+void nyxstone_glue_emit_fill (uint64_t n, int fill)
+{
+    if (!n) return;
+    GAS_ENTER ();
+    if (reserve_fill_bytes (n)) {
+        char *dst = frag_more ((size_t) n);
+        memset (dst, fill, (size_t) n);
+    }
+    GAS_LEAVE ();
 }
 
 /* Emit a `.byte/.hword/.word/.quad`-style data list whose operands may contain
@@ -352,10 +499,12 @@ void nyxstone_glue_emit_cons (const char *args, int nbytes)
     buf[len]     = '\n';     /* statement terminator cons() stops at */
     buf[len + 1] = '\0';
 
+    GAS_ENTER ();
     char *saved = input_line_pointer;
     input_line_pointer = buf;
     cons (nbytes);           /* emits bytes + fixups into the current frag */
     input_line_pointer = saved;
+    GAS_LEAVE ();
     free (buf);
 }
 
@@ -373,7 +522,9 @@ size_t nyxstone_glue_frag_now_fix (void)
    final. */
 void nyxstone_glue_align (unsigned int p2, int fill, unsigned int max)
 {
+    GAS_ENTER ();
     frag_align ((int) p2, fill, (int) max);
+    GAS_LEAVE ();
 }
 
 /* `.org target[, fill]`: rs_org frag; target is the section-relative
@@ -382,9 +533,11 @@ void nyxstone_glue_align (unsigned int p2, int fill, unsigned int max)
    .org backwards"). */
 void nyxstone_glue_org (uint64_t target, int fill)
 {
+    GAS_ENTER ();
     char *p = frag_var (rs_org, 1, 1, (relax_substateT) 0,
                         (symbolS *) NULL, (offsetT) target, (char *) NULL);
     *p = (char) fill;
+    GAS_LEAVE ();
 }
 
 int nyxstone_glue_had_errors (void)
@@ -640,15 +793,23 @@ static int encode_pcrel_field (uint8_t *buf, size_t total, size_t at,
         wr_le (buf, at, 4, (uint32_t) value);
         return 1;
     }
+    /* The 8-bit and 16-bit forms have the range rule of gas's fixup_segment
+       for an unsigned field: the value or its negation must fit the field. */
+#define FITS(v, bits) \
+    ((((unsigned long) (v)) >> (bits)) == 0 \
+     || ((0UL - (unsigned long) (v)) >> (bits)) == 0)
     if (R_IS ("16ABS") || (howto->dst_mask == 0xffffu && howto->bitpos == 0)) {
         if (at + 2 > total) return 0;
+        if (!FITS (value, 16)) return -1;
         wr_le (buf, at, 2, (uint32_t) value & 0xffffu);
         return 1;
     }
     if (R_IS ("8ABS") || (howto->dst_mask == 0xffu && howto->bitpos == 0)) {
+        if (!FITS (value, 8)) return -1;
         buf[at] = (uint8_t) value;
         return 1;
     }
+#undef FITS
 
     /* ---- instruction relocations: read the opcode word (its width is encoded
        in the low bit of the first byte, TriCore's 16/32-bit marker), apply the
@@ -791,6 +952,19 @@ static int apply_text_fixups (segT seg, uint64_t base)
     int unresolved = 0;
     for (frchainS *fc = si->frchainP; fc; fc = fc->frch_next)
         for (fixS *fx = fc->fix_root; fx; fx = fx->fx_next) {
+            /* A difference `a - b` needs both symbols: no TriCore relocation
+               can hold it.  (gas folds the difference at parse time when
+               both symbols are behind the directive; this is the other
+               case.) */
+            if (fx->fx_subsy) {
+                resolve_symbol_value (fx->fx_subsy);
+                if (fx->fx_addsy) resolve_symbol_value (fx->fx_addsy);
+                if (!fx->fx_addsy || !S_IS_DEFINED (fx->fx_addsy)
+                    || !S_IS_DEFINED (fx->fx_subsy))
+                    as_bad ("can't resolve the difference with '%s'",
+                            S_GET_NAME (fx->fx_subsy));
+                continue;
+            }
             if (!fx->fx_addsy) continue;
             resolve_symbol_value (fx->fx_addsy);
             if (S_IS_DEFINED (fx->fx_addsy)) continue;   /* encoded below */
@@ -820,6 +994,13 @@ static int apply_text_fixups (segT seg, uint64_t base)
                              ? base + (uint64_t) S_GET_VALUE (fx->fx_addsy)
                              : (uint64_t) S_GET_VALUE (fx->fx_addsy);
             long value;
+            if (fx->fx_subsy) {            /* a - b: both sides absolute */
+                if (!S_IS_DEFINED (fx->fx_subsy)) continue;
+                uint64_t sub_abs = (S_GET_SEGMENT (fx->fx_subsy) == seg)
+                                 ? base + (uint64_t) S_GET_VALUE (fx->fx_subsy)
+                                 : (uint64_t) S_GET_VALUE (fx->fx_subsy);
+                value = (long) (sym_abs + fx->fx_offset) - (long) sub_abs;
+            } else
             if (howto->pc_relative)        /* displacement: both sides absolute */
                 value = (long) (sym_abs + fx->fx_offset)
                       - (long) (base + md_pcrel_from_section (fx, seg));
@@ -834,7 +1015,7 @@ static int apply_text_fixups (segT seg, uint64_t base)
             else if (rc < 0)
                 /* Out of range for the chosen form; raise a gas error so
                    do_assemble surfaces it instead of emitting truncated bytes. */
-                as_bad ("displacement to '%s' out of range for %s",
+                as_bad ("value for '%s' out of range for %s",
                         S_GET_NAME (fx->fx_addsy),
                         howto->name ? howto->name : "branch");
         }
@@ -854,6 +1035,8 @@ static int apply_text_fixups (segT seg, uint64_t base)
     return unresolved;
 }
 
+static int resolve_text_fixups_guarded (uint64_t base);
+
 int nyxstone_glue_resolve_text_fixups (uint64_t base)
 {
     /* Phase order for this gas port, minimised for one section:
@@ -870,6 +1053,14 @@ int nyxstone_glue_resolve_text_fixups (uint64_t base)
                                 encode every displacement/absolute field.
        Symbol re-resolution is exact because gas only caches resolved
        values once `finalize_syms` is set, which we never do. */
+    GAS_ENTER (0);
+    int unresolved = resolve_text_fixups_guarded (base);
+    GAS_LEAVE ();
+    return unresolved;
+}
+
+static int resolve_text_fixups_guarded (uint64_t base)
+{
     relax_branches (text_section);
 
     segment_info_type *si = seg_info (text_section);
@@ -885,6 +1076,13 @@ int nyxstone_glue_resolve_text_fixups (uint64_t base)
                 md_convert_frag (stdoutput, text_section, fr);
     finalize_align_org (text_section);
     layout (text_section);
+
+    /* Limit check before the first allocation of the section size. */
+    if (nyxstone_glue_extract_text_bytes (NULL, 0) > NYX_MAX_TEXT_BYTES) {
+        as_bad ("the section is larger than the limit of %lu bytes",
+                (unsigned long) NYX_MAX_TEXT_BYTES);
+        return 0;
+    }
 
     return apply_text_fixups (text_section, base);
 }

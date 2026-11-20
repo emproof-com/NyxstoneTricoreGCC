@@ -80,7 +80,8 @@ fn connect(timeout: Option<Duration>) -> Result<Inner, Error> {
         .map_err(|e| Error::Init(format!("dup socket: {e}")))?);
     let mut inner = Inner { reader, writer, daemon };
 
-    // Handshake: read the daemon's magic + version, fail loudly on mismatch.
+    // Handshake: read the daemon's magic, wire format version and crate
+    // version; a daemon of a different release is an error.
     p::read_handshake(&mut inner.reader)
         .map_err(|e| Error::Init(format!("handshake: {e}")))?;
 

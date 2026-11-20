@@ -32,7 +32,9 @@
 // symbol references, resolution-path relocation encodings (24ABS/HI/HIADJ/
 // 18ABS and other non-linear forms), relocation offsets through
 // relaxation/alignment, the data fast-path vs gas's cons, an instruction
-// idempotence corpus, error-message quality, and 32-bit address masking.
+// idempotence corpus, error-message quality, 32-bit address masking, and the
+// findings of the 0.2.3 review (symbol differences, `.`, the instruction
+// list, string escapes, character literals, the size limit).
 
 #include "nyxstone/nyxstone.h"
 
@@ -1065,16 +1067,127 @@ int main() {
     std::printf("  %d branch-relax pass, %d fail (%zu sources x 2 addresses)\n",
                 br_pass, br_fail, BRANCH_RELAX_CORPUS.size());
 
+    // Findings of the 0.2.3 review (GitHub issue 1).
+    std::printf("\n--- review findings ---\n");
+    int rf_pass = 0, rf_fail = 0;
+    {
+        auto check = [&](bool ok, const char* name) {
+            if (ok) ++rf_pass;
+            else { std::printf("  FAIL  %s\n", name); ++rf_fail; }
+        };
+        auto bytes_are = [&](const char* src, uint64_t addr, const std::vector<uint8_t>& want,
+                             const char* name) {
+            auto o = a.assemble(src, addr, {});
+            if (o && *o == want) { ++rf_pass; return; }
+            std::printf("  FAIL  %s: got %s\n", name,
+                        o ? hex(*o).c_str() : o.error().c_str());
+            ++rf_fail;
+        };
+        auto fails_with = [&](const char* src, const char* substr, const char* name) {
+            auto o = a.assemble(src, 0x1000, {});
+            if (!o && o.error().find(substr) != std::string::npos) { ++rf_pass; return; }
+            std::printf("  FAIL  %s: %s\n", name,
+                        o ? "unexpectedly assembled" : o.error().c_str());
+            ++rf_fail;
+        };
+
+        // S1: a symbol difference with a symbol in front of the directive
+        // (gas cannot fold it at parse time).
+        bytes_are("a: .word b - a\nnop\nb: nop\n", 0x1000, B({0x06,0,0,0, 0,0, 0,0}),
+                  "forward difference b - a");
+        bytes_are("a: nop\n.word a - b\nb: nop\n", 0x1000, B({0,0, 0xfa,0xff,0xff,0xff, 0,0}),
+                  "negative difference a - b");
+        bytes_are("a: .hword b - a\nb: nop\n", 0x1000, B({0x02,0, 0,0}),
+                  "16-bit difference");
+        check(!a.assemble_with_relocs(".word ext - a\na: nop\n", 0x1000, {}),
+              "difference ext - a is an error in relocation mode");
+        check(!a.assemble_with_relocs("nop\na: .word a - ext\n", 0x1000, {}),
+              "difference a - ext is an error in relocation mode");
+        fails_with("a: .word a - nowhere\n", "nowhere", "difference with an undefined symbol");
+        // Range of the 8-bit and 16-bit data forms.
+        fails_with("a: .byte a\n", "out of range", ".byte with an address above 8 bits");
+        fails_with("a: .hword a + 0x10000\n", "out of range", ".hword with a value above 16 bits");
+        bytes_are("a: .byte a\n", 0, B({0}), ".byte with a small address");
+        bytes_are("nop\na: .hword a\n", 0x1000, B({0,0, 0x02,0x10}), ".hword with a 16-bit address");
+        bytes_are("a: nop\nb: .byte a - b\n", 0x1000, B({0,0, 0xfe}), ".byte with a negative difference");
+
+        // S2: `.` is the current location.
+        for (int rep = 0; rep < 2; ++rep) {
+            bytes_are("nop\nj .\n", 0x1000, B({0,0, 0x3c,0x00}), "j .");
+            bytes_are("nop\nnop\n.word .\n", 0x1000, B({0,0, 0,0, 0x04,0x10,0,0}), ".word .");
+        }
+
+        // S3: the instruction list has the instructions only.
+        {
+            auto v = a.assemble_to_instructions("nop\n.asciz \"hello\"\nret\n", 0x1000, {});
+            check(v && v->size() == 2
+                  && (*v)[0].address == 0x1000 && (*v)[0].assembly.rfind("nop", 0) == 0
+                  && (*v)[1].address == 0x1008 && (*v)[1].assembly.rfind("ret", 0) == 0
+                  && (*v)[1].bytes == B({0x00, 0x90}),
+                  "string data between instructions");
+            v = a.assemble_to_instructions(".word 0xdeadbeef\nnop\n", 0x1000, {});
+            check(v && v->size() == 1 && (*v)[0].address == 0x1004 && (*v)[0].assembly.rfind("nop", 0) == 0,
+                  "data word in front of an instruction");
+            // A relaxed branch (2 bytes), data, an alignment and the target.
+            v = a.assemble_to_instructions(
+                "j end\n.byte 1\n.align 2\n.word 0xdeadbeef\nend: ret\n", 0x1000, {});
+            check(v && v->size() == 2
+                  && (*v)[0].address == 0x1000 && (*v)[0].bytes.size() == 2
+                  && branch_target((*v)[0].assembly) == 0x1008
+                  && (*v)[1].address == 0x1008 && (*v)[1].assembly.rfind("ret", 0) == 0,
+                  "relaxed branch over data and padding");
+            v = a.assemble_to_instructions(".word 1, 2\n.asciz \"x\"\n", 0x1000, {});
+            check(v && v->empty(), "data only gives an empty list");
+            auto w = a.assemble_to_instructions_with_relocs(
+                "call ext\n.word 0xdeadbeef\nret\n", 0x1000, {});
+            check(w && w->instructions.size() == 2
+                  && w->instructions[0].address == 0x1000
+                  && w->instructions[1].address == 0x1008
+                  && w->instructions[1].assembly.rfind("ret", 0) == 0
+                  && w->relocations.size() == 1,
+                  "instruction list in relocation mode");
+        }
+
+        // S4: string escapes and character literals as in gas.
+        bytes_are(".ascii \"\\x41\"\n", 0, B({0x41}), "hex escape");
+        bytes_are(".ascii \"\\x4a\\X4B\"\n", 0, B({0x4a, 0x4b}), "hex escape, both cases");
+        bytes_are(".ascii \"\\101\"\n", 0, B({0x41}), "octal escape");
+        bytes_are(".ascii \"\\1018\\0\"\n", 0, B({0x41, 0x38, 0x00}), "octal escape has three digits");
+        bytes_are(".ascii \"\\b\\f\\v\\n\\r\\t\"\n", 0, B({8, 12, 11, 10, 13, 9}), "control escapes");
+        bytes_are(".ascii \"\\\\\\\"\"\n", 0, B({0x5c, 0x22}), "backslash and quote escapes");
+        bytes_are(".byte '#'\n", 0, B({0x23}), "character literal #");
+        bytes_are(".byte ';', '/', 'a'\nnop\n", 0, B({0x3b, 0x2f, 0x61, 0, 0}),
+                  "character literals with separator characters");
+        bytes_are(".byte '\\n', '\\\\', '\"'\n", 0, B({0x0a, 0x5c, 0x22}), "escaped character literals");
+        bytes_are("mov %d0, 'A'\n", 0, *a.assemble("mov %d0, 65\n", 0, {}),
+                  "character literal as an instruction operand");
+
+        // S5: a size above the limit is an error, and the next call works.
+        fails_with(".skip 0x80000000\n", "limit", ".skip of 2 GiB");
+        fails_with(".skip 0x100000000\n", "limit", ".skip of 4 GiB");
+        fails_with(".skip 0x3000000\n.skip 0x3000000\n", "limit", "two .skip above the limit");
+        fails_with(".org 0x7fffffffffff\n", "limit", ".org with a very large offset");
+        fails_with("nop\n.align 30\n", "limit", ".align with 1 GiB of padding");
+        bytes_are("nop\n", 0x1000, B({0, 0}), "assemble after the size errors");
+        {
+            auto o = a.assemble(".skip 0x100000, 0xab\nnop\n", 0, {});
+            check(o && o->size() == 0x100002 && (*o)[0] == 0xab && (*o)[0xfffff] == 0xab
+                  && (*o)[0x100000] == 0,
+                  ".skip of 1 MiB with a fill value");
+        }
+    }
+    std::printf("  %d review-finding pass, %d fail\n", rf_pass, rf_fail);
+
     int extra_fail = el_fail + ai_fail + dc_fail + wr_fail + air_fail + wri_fail + bd_fail + ds_fail
                    + em_fail + am_fail + rr_fail + ro_fail + fc_fail + ic_fail + isa_fail + an_fail + ls_fail
-                   + br_fail;
+                   + br_fail + rf_fail;
     std::printf("\nSummary: %d passed, %d failed, %d drifts (of %zu tests); "
                 "%d disasm round-trips passed, %d failed; "
                 "%d additional API checks passed, %d failed\n",
                 r.passed, r.failed, r.drift, TESTS.size(), rt_pass, rt_fail,
                 el_pass + ai_pass + dc_pass + wr_pass + air_pass + wri_pass + bd_pass + ds_pass
                 + em_pass + am_pass + rr_pass + ro_pass + fc_pass + ic_pass + isa_pass + an_pass + ls_pass
-                + br_pass,
+                + br_pass + rf_pass,
                 extra_fail);
     return (r.failed == 0 && r.drift == 0 && rt_fail == 0 && extra_fail == 0) ? 0 : 1;
 }

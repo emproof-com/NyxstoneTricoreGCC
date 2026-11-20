@@ -11,7 +11,7 @@
 
 cmake_minimum_required(VERSION 3.16)
 project(nyxstone_tricore
-    VERSION 0.2.3
+    VERSION 0.2.4
     DESCRIPTION "In-process TriCore assembler/disassembler built on EEESlab tricore-binutils-gdb"
     LANGUAGES C CXX)
 

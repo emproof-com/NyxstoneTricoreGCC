@@ -475,6 +475,29 @@ mod tests {
     }
 
     #[test]
+    fn review_findings_of_0_2_3() {
+        let nx = NyxstoneTricoreGCC::new().unwrap();
+        // A symbol difference with a symbol in front of the directive.
+        assert_eq!(nx.assemble("a: .word b - a\nnop\nb: nop\n", 0x1000, &[]).unwrap(),
+                   vec![0x06, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(nx.assemble_with_relocs(".word ext - a\na: nop\n", 0x1000, &[]).is_err());
+        // `.` is the current location (this ended the process before).
+        assert_eq!(nx.assemble("nop\nj .\n", 0x1000, &[]).unwrap(), vec![0, 0, 0x3c, 0x00]);
+        // The instruction list has the instructions only, not the data.
+        let insns = nx.assemble_to_instructions("nop\n.asciz \"hello\"\nret\n", 0x1000, &[]).unwrap();
+        assert_eq!(insns.len(), 2);
+        assert_eq!(insns[1].address, 0x1008);
+        assert_eq!(insns[1].bytes, vec![0x00, 0x90]);
+        // The escapes of gas, and a character literal with a comment character.
+        assert_eq!(nx.assemble(".ascii \"\\x41\\101\\b\"\n.byte '#'\n", 0, &[]).unwrap(),
+                   vec![0x41, 0x41, 0x08, 0x23]);
+        // A size above the limit is an error, and the instance stays usable.
+        assert!(nx.assemble(".skip 0x100000000\n", 0, &[]).is_err());
+        assert!(nx.assemble(".skip 0x80000000\n", 0, &[]).is_err());
+        assert_eq!(nx.assemble("nop", 0, &[]).unwrap(), vec![0x00, 0x00]);
+    }
+
+    #[test]
     fn assemble_labels() {
         let nx = NyxstoneTricoreGCC::new().unwrap();
         let b = nx.assemble("start:\n nop\n j here\nhere:\n ret\n", 0, &[]).unwrap();
